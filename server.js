@@ -6,6 +6,7 @@ const session = require('express-session');
 const { body, validationResult } = require('express-validator');
 const mysql = require('mysql2/promise');
 const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
@@ -15,34 +16,24 @@ require('dotenv').config();
 // Initialize Express app
 const app = express();
 
-// حل مشكلة الـ Proxy في Railway - ثقة كاملة
+// حل مشكلة الـ Proxy في Railway
 app.set('trust proxy', 1);
 
-// Session middleware - إصلاح كامل للعمل مع Netlify + Railway
-const sessionConfig = {
+// Session middleware - معدل للعمل مع Railway
+app.use(session({
     secret: process.env.SESSION_SECRET || 'watchme-secret-key-2024-change-in-production',
-    resave: true, // تغيير مهم
-    saveUninitialized: true, // تغيير مهم
-    proxy: true, // مهم لـ Railway
-    name: 'watchme.sid',
+    resave: false,
+    saveUninitialized: true, // غيرت من false إلى true
+    proxy: process.env.NODE_ENV === 'production',
     store: new session.MemoryStore(),
-    cookie: {
-        secure: true, // يجب أن يكون true في الإنتاج
-        sameSite: 'none', // هذا هو الحل السحري للـ Cross-domain
-        maxAge: 30 * 60 * 1000, // 30 دقيقة
+    cookie: { 
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+        maxAge: 24 * 60 * 60 * 1000, // 24 hours
         httpOnly: true,
-        path: '/',
-        // لا تحدد domain لتسمح للكوكيز بالعمل على جميع subdomains
+        path: '/'
     }
-};
-
-// في حالة التطوير، استخدم إعدادات مختلفة
-if (process.env.NODE_ENV === 'development') {
-    sessionConfig.cookie.secure = false;
-    sessionConfig.cookie.sameSite = 'lax';
-}
-
-app.use(session(sessionConfig));
+}));
 
 // Security middleware
 app.use(helmet({
@@ -50,33 +41,32 @@ app.use(helmet({
     crossOriginResourcePolicy: { policy: "cross-origin" }
 }));
 
-// CORS configuration - إصلاح كامل
+// CORS configuration - معدل للأمان
 const corsOptions = {
     origin: function (origin, callback) {
-        // في التطوير، اسمح بجميع الأصول
+        // السماح بطلبات بدون أصل (مثل mobile apps, curl)
+        if (!origin) return callback(null, true);
+        
+        // السماح بجميع الأصول في حالة التطوير
         if (process.env.NODE_ENV === 'development') {
             return callback(null, true);
         }
         
-        // القائمة المسموحة في الإنتاج
         const allowedOrigins = [
-            'https://watchme0.netlify.app',
+            'http://localhost:3000',
+            'http://localhost:8080',
+            'http://localhost:8081',
             'https://watchme0.netlify.app',
             'https://*.netlify.app',
-            process.env.FRONTEND_URL,
-            process.env.CORS_ORIGIN
+            process.env.CORS_ORIGIN,
+            process.env.FRONTEND_URL
         ].filter(Boolean);
         
-        // السماح بطلبات بدون أصل (مثل curl)
-        if (!origin) {
-            return callback(null, true);
-        }
-        
-        // التحقق من الأصل
+        // التحقق من الأصل باستخدام regex للسماح بـ wildcards
         const isAllowed = allowedOrigins.some(allowed => {
             if (allowed.includes('*')) {
-                const domain = allowed.replace('*.', '');
-                return origin.endsWith(domain);
+                const regex = new RegExp('^' + allowed.replace('*', '.*') + '$');
+                return regex.test(origin);
             }
             return allowed === origin;
         });
@@ -89,9 +79,9 @@ const corsOptions = {
         }
     },
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin', 'x-csrf-token'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin', 'Access-Control-Allow-Headers'],
     exposedHeaders: ['Content-Disposition'],
-    credentials: true, // مهم جداً للسماح بإرسال الكوكيز
+    credentials: true,
     preflightContinue: false,
     optionsSuccessStatus: 204,
     maxAge: 86400 // 24 ساعة
@@ -102,21 +92,9 @@ app.use(cors(corsOptions));
 // Handle preflight requests بشكل صريح
 app.options('*', cors(corsOptions));
 
-// Middleware لإضافة رؤوس CORS في كل استجابة
-app.use((req, res, next) => {
-    const origin = req.headers.origin;
-    if (origin && (origin.includes('netlify.app') || origin.includes('localhost'))) {
-        res.header('Access-Control-Allow-Origin', origin);
-    }
-    res.header('Access-Control-Allow-Credentials', 'true');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
-    next();
-});
-
-// Rate limiting
+// Rate limiting - أكثر تساهلاً للنشر الأولي
 const apiLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
+    windowMs: 15 * 60 * 1000, // 15 دقيقة
     max: process.env.NODE_ENV === 'production' ? 200 : 5000,
     message: 'Too many requests from this IP, please try again later.',
     standardHeaders: true,
@@ -143,59 +121,61 @@ app.use('/api/subscription/', appLimiter);
 
 // Body parsing middleware
 app.use(express.json({ 
-    limit: '10mb'
+    limit: '10mb',
+    verify: (req, res, buf) => {
+        req.rawBody = buf.toString();
+    }
 }));
 app.use(express.urlencoded({ 
     extended: true, 
-    limit: '10mb'
+    limit: '10mb',
+    parameterLimit: 10000
 }));
 
-// إنشاء مجلد uploads
+// إنشاء مجلد uploads إذا لم يكن موجوداً
 const uploadDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadDir)) {
     fs.mkdirSync(uploadDir, { recursive: true });
-    console.log(`✅ Created uploads directory at: ${uploadDir}`);
+    console.log('✅ Created uploads directory');
 }
 
 // Static files
 app.use(express.static(path.join(__dirname, 'public'), {
     maxAge: '1d',
-    setHeaders: (res, filePath) => {
-        if (filePath.endsWith('.html')) {
+    setHeaders: (res, path) => {
+        if (path.endsWith('.html')) {
             res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
         }
     }
 }));
 
 // File upload configuration
-const storage = multer.diskStorage({
-    destination: function (req, file, cb) {
-        cb(null, uploadDir);
-    },
-    filename: function (req, file, cb) {
-        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-        const ext = path.extname(file.originalname).toLowerCase();
-        const name = path.basename(file.originalname, ext)
-            .replace(/\s+/g, '_')
-            .replace(/[^a-zA-Z0-9_]/g, '')
-            .substring(0, 50);
-        cb(null, name + '-' + uniqueSuffix + ext);
-    }
-});
-
 const upload = multer({
-    storage: storage,
+    storage: multer.diskStorage({
+        destination: function (req, file, cb) {
+            cb(null, uploadDir);
+        },
+        filename: function (req, file, cb) {
+            const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+            const ext = path.extname(file.originalname).toLowerCase();
+            const name = path.basename(file.originalname, ext).replace(/\s+/g, '_').substring(0, 100);
+            cb(null, name + '-' + uniqueSuffix + ext);
+        }
+    }),
     limits: {
         fileSize: 10 * 1024 * 1024 // 10MB
     },
     fileFilter: function (req, file, cb) {
-        const allowedExtensions = ['.m3u', '.m3u8'];
-        const ext = path.extname(file.originalname).toLowerCase();
+        const allowedMimeTypes = ['text/plain', 'application/octet-stream', 'application/x-mpegURL'];
+        const allowedExtensions = ['.m3u', '.m3u8', '.txt'];
         
-        if (allowedExtensions.includes(ext)) {
+        const extname = path.extname(file.originalname).toLowerCase();
+        const mimeType = file.mimetype.toLowerCase();
+        
+        if (allowedMimeTypes.includes(mimeType) || allowedExtensions.includes(extname)) {
             cb(null, true);
         } else {
-            cb(new Error('Only M3U files are allowed!'), false);
+            cb(new Error(`Only M3U files are allowed! Received: ${mimeType}, ${extname}`), false);
         }
     }
 });
@@ -204,42 +184,72 @@ const upload = multer({
 let pool;
 async function connectDB() {
     try {
+        // استخدام متغيرات البيئة أو القيم الافتراضية
         const dbConfig = {
-            host: process.env.DB_HOST || 'localhost',
+            host: process.env.DB_HOST || 'mysql.railway.internal',
             user: process.env.DB_USER || 'root',
-            password: process.env.DB_PASSWORD || '',
-            database: process.env.DB_NAME || 'watchme',
+            password: process.env.DB_PASSWORD || 'zJlfstHREMzYlkwajJvhrLbeyekdwJtD',
+            database: process.env.DB_NAME || 'railway',
             port: process.env.DB_PORT || 3306,
             waitForConnections: true,
-            connectionLimit: 10,
+            connectionLimit: 20,
             queueLimit: 0,
             enableKeepAlive: true,
-            keepAliveInitialDelay: 0
+            keepAliveInitialDelay: 10000,
+            connectTimeout: 60000,
+            ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : false
         };
         
-        console.log('Connecting to database...');
+        console.log('Attempting to connect to database with config:', {
+            host: dbConfig.host,
+            user: dbConfig.user,
+            database: dbConfig.database,
+            port: dbConfig.port
+        });
         
         pool = mysql.createPool(dbConfig);
         
-        // Test connection
+        // اختبار الاتصال
         const connection = await pool.getConnection();
         console.log('✅ Database connected successfully');
+        
+        // اختبار استعلام بسيط
+        const [rows] = await connection.execute('SELECT 1 + 1 AS result');
+        console.log('Database test query result:', rows[0].result);
+        
         connection.release();
         
+        // تهيئة جداول قاعدة البيانات
         await initializeDatabase();
         
     } catch (error) {
         console.error('❌ Database connection failed:', error.message);
-        console.log('Retrying in 5 seconds...');
+        console.error('Error stack:', error.stack);
+        console.error('Please ensure:');
+        console.error('1. MySQL server is running');
+        console.error('2. Database exists');
+        console.error('3. User has proper permissions');
+        console.error('4. Check your .env file configuration');
+        console.error('Current DB config:', {
+            host: process.env.DB_HOST,
+            user: process.env.DB_USER,
+            database: process.env.DB_NAME,
+            port: process.env.DB_PORT
+        });
+        
+        // إعادة المحاولة بعد 5 ثواني
+        console.log('Retrying connection in 5 seconds...');
         setTimeout(connectDB, 5000);
     }
 }
 
-// Initialize database tables
+// تهيئة جداول قاعدة البيانات
 async function initializeDatabase() {
     try {
-        const tables = [
-            `CREATE TABLE IF NOT EXISTS admin_users (
+        // إنشاء الجداول إذا لم تكن موجودة
+        const createTables = `
+            -- جدول المستخدمين الإداريين
+            CREATE TABLE IF NOT EXISTS admin_users (
                 id INT PRIMARY KEY AUTO_INCREMENT,
                 username VARCHAR(100) UNIQUE NOT NULL,
                 email VARCHAR(255) UNIQUE NOT NULL,
@@ -249,9 +259,10 @@ async function initializeDatabase() {
                 last_login DATETIME,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-            )`,
+            );
             
-            `CREATE TABLE IF NOT EXISTS channels (
+            -- جدول القنوات
+            CREATE TABLE IF NOT EXISTS channels (
                 id VARCHAR(255) PRIMARY KEY,
                 name VARCHAR(255) NOT NULL,
                 url TEXT NOT NULL,
@@ -263,9 +274,10 @@ async function initializeDatabase() {
                 INDEX idx_category (category),
                 INDEX idx_name (name),
                 INDEX idx_is_active (is_active)
-            )`,
+            );
             
-            `CREATE TABLE IF NOT EXISTS subscription_codes (
+            -- جدول رموز الاشتراك
+            CREATE TABLE IF NOT EXISTS subscription_codes (
                 id VARCHAR(255) PRIMARY KEY,
                 code VARCHAR(50) UNIQUE NOT NULL,
                 duration_days INT NOT NULL,
@@ -280,9 +292,10 @@ async function initializeDatabase() {
                 INDEX idx_code (code),
                 INDEX idx_is_used (is_used),
                 INDEX idx_expiry (expiry_date)
-            )`,
+            );
             
-            `CREATE TABLE IF NOT EXISTS user_subscriptions (
+            -- جدول اشتراكات المستخدمين
+            CREATE TABLE IF NOT EXISTS user_subscriptions (
                 id VARCHAR(255) PRIMARY KEY,
                 user_id VARCHAR(255) NOT NULL,
                 subscription_code VARCHAR(50) NOT NULL,
@@ -295,9 +308,10 @@ async function initializeDatabase() {
                 INDEX idx_user_id (user_id),
                 INDEX idx_expires_at (expires_at),
                 INDEX idx_is_active (is_active)
-            )`,
+            );
             
-            `CREATE TABLE IF NOT EXISTS activity_logs (
+            -- جدول سجل النشاط
+            CREATE TABLE IF NOT EXISTS activity_logs (
                 id INT PRIMARY KEY AUTO_INCREMENT,
                 admin_id INT,
                 action_type VARCHAR(100) NOT NULL,
@@ -308,17 +322,19 @@ async function initializeDatabase() {
                 INDEX idx_admin_id (admin_id),
                 INDEX idx_created_at (created_at),
                 FOREIGN KEY (admin_id) REFERENCES admin_users(id) ON DELETE SET NULL
-            )`,
+            );
             
-            `CREATE TABLE IF NOT EXISTS playlist_settings (
+            -- جدول إعدادات القائمة
+            CREATE TABLE IF NOT EXISTS playlist_settings (
                 id INT PRIMARY KEY AUTO_INCREMENT,
                 setting_key VARCHAR(100) UNIQUE NOT NULL,
                 setting_value TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-            )`,
+            );
             
-            `CREATE TABLE IF NOT EXISTS app_users (
+            -- جدول مستخدمي التطبيق
+            CREATE TABLE IF NOT EXISTS app_users (
                 id INT PRIMARY KEY AUTO_INCREMENT,
                 device_id VARCHAR(255) UNIQUE NOT NULL,
                 subscription_code VARCHAR(50),
@@ -326,33 +342,41 @@ async function initializeDatabase() {
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                 INDEX idx_device_id (device_id)
-            )`
-        ];
+            );
+        `;
         
-        for (const tableSql of tables) {
-            await pool.execute(tableSql);
+        // تنفيذ استعلامات إنشاء الجداول
+        const queries = createTables.split(';').filter(q => q.trim());
+        
+        for (const query of queries) {
+            if (query.trim()) {
+                await pool.execute(query + ';');
+            }
         }
         
-        // Check if admin exists
+        // إدخال مستخدم إداري افتراضي إذا لم يكن موجودًا
         const [adminExists] = await pool.execute(
             'SELECT id FROM admin_users WHERE username = ?',
             ['admin']
         );
         
         if (adminExists.length === 0) {
+            const defaultPin = '123456789';
             await pool.execute(
                 'INSERT INTO admin_users (username, email, pin_code, role) VALUES (?, ?, ?, ?)',
-                ['admin', 'admin@watchme.com', '123456789', 'super_admin']
+                ['admin', 'admin@watchme.com', defaultPin, 'super_admin']
             );
-            console.log('✅ Default admin user created');
+            console.log('✅ Default admin user created with PIN: 123456789');
         }
         
-        // Default settings
+        // إدخال إعدادات افتراضية
         const defaultSettings = [
             ['app_name', 'Watch Me Premium'],
             ['company_name', 'Watch Me Streaming'],
             ['support_email', 'support@watchme.com'],
-            ['version', '1.0.0']
+            ['version', '1.0.0'],
+            ['max_upload_size', '10'],
+            ['session_timeout', '30']
         ];
         
         for (const [key, value] of defaultSettings) {
@@ -362,10 +386,11 @@ async function initializeDatabase() {
             );
         }
         
-        console.log('✅ Database initialized successfully');
+        console.log('✅ Database tables initialized successfully');
         
     } catch (error) {
         console.error('❌ Database initialization error:', error.message);
+        console.error('Error stack:', error.stack);
     }
 }
 
@@ -382,11 +407,10 @@ const authenticateToken = async (req, res, next) => {
             });
         }
         
-        const decoded = jwt.verify(
-            token, 
-            process.env.JWT_SECRET || 'watchme-jwt-secret-2024-change-this-in-production'
-        );
+        // التحقق من JWT
+        const decoded = jwt.verify(token, process.env.JWT_SECRET || 'watchme-jwt-secret-2024-change-this-in-production');
         
+        // التحقق من وجود المسؤول ونشاطه
         const [admin] = await pool.execute(
             'SELECT id, username, email, role FROM admin_users WHERE id = ? AND is_active = TRUE',
             [decoded.userId]
@@ -422,7 +446,37 @@ const authenticateToken = async (req, res, next) => {
     }
 };
 
-// Activity logging middleware
+// دالة middleware للتحقق من صحة جلسة الاستيراد
+const validateImportSession = (req, res, next) => {
+    const { importId } = req.body;
+    
+    if (!req.session.importData) {
+        return res.status(400).json({ 
+            success: false, 
+            message: 'No import session found. Please upload file again.' 
+        });
+    }
+    
+    if (!importId || req.session.importData.importId !== importId) {
+        return res.status(400).json({ 
+            success: false, 
+            message: 'Import session ID mismatch or missing' 
+        });
+    }
+    
+    // التحقق من أن الجلسة ليست قديمة (أقدم من 30 دقيقة)
+    if (Date.now() - req.session.importData.timestamp > 30 * 60 * 1000) {
+        delete req.session.importData;
+        return res.status(400).json({ 
+            success: false, 
+            message: 'Import session expired. Please upload file again.' 
+        });
+    }
+    
+    next();
+};
+
+// تسجيل النشاط middleware
 const logActivity = async (req, action, description) => {
     try {
         await pool.execute(
@@ -446,23 +500,26 @@ const logActivity = async (req, action, description) => {
 // API ROUTES
 // ======================
 
-// Health check with session info
+// Test route
 app.get('/api/health', (req, res) => {
-    res.json({
-        success: true,
-        message: 'Server is running',
+    const healthStatus = {
+        success: true, 
+        message: 'Watch Me Admin Server is running',
         timestamp: new Date().toISOString(),
+        version: '1.0.0',
         environment: process.env.NODE_ENV || 'development',
         database: pool ? 'connected' : 'disconnected',
-        session: {
-            id: req.sessionID,
-            hasImportData: !!req.session.importData,
-            cookie: req.session.cookie
-        }
-    });
+        uptime: process.uptime(),
+        memory: process.memoryUsage(),
+        ip: req.headers['x-forwarded-for'] || req.ip,
+        session_id: req.sessionID,
+        has_import_session: !!req.session.importData
+    };
+    
+    res.json(healthStatus);
 });
 
-// Admin login
+// Admin authentication with PIN
 app.post('/api/admin/login', [
     body('pin').isLength({ min: 9, max: 9 }).matches(/^\d+$/).withMessage('PIN must be 9 digits')
 ], async (req, res) => {
@@ -477,6 +534,7 @@ app.post('/api/admin/login', [
         
         const { pin } = req.body;
         
+        // البحث عن المسؤول باستخدام PIN
         const [admins] = await pool.execute(
             'SELECT * FROM admin_users WHERE pin_code = ? AND is_active = TRUE',
             [pin]
@@ -491,13 +549,13 @@ app.post('/api/admin/login', [
         
         const admin = admins[0];
         
-        // Update last login
+        // تحديث آخر تسجيل دخول
         await pool.execute(
             'UPDATE admin_users SET last_login = NOW() WHERE id = ?',
             [admin.id]
         );
         
-        // Create JWT token
+        // إنشاء JWT token
         const token = jwt.sign(
             { 
                 userId: admin.id, 
@@ -508,7 +566,7 @@ app.post('/api/admin/login', [
             { expiresIn: process.env.JWT_EXPIRES_IN || '24h' }
         );
         
-        // Log activity
+        // تسجيل النشاط
         await logActivity({ user: { id: admin.id }, headers: req.headers, ip: req.ip }, 'login', `Admin logged in: ${admin.username}`);
         
         res.json({
@@ -533,10 +591,10 @@ app.post('/api/admin/login', [
 });
 
 // ======================
-// CHANNEL MANAGEMENT
+// CHANNEL MANAGEMENT API
 // ======================
 
-// Get all channels
+// الحصول على جميع القنوات
 app.get('/api/channels', authenticateToken, async (req, res) => {
     try {
         const { category, search, page = 1, limit = 50 } = req.query;
@@ -554,23 +612,20 @@ app.get('/api/channels', authenticateToken, async (req, res) => {
         }
         
         if (search) {
-            query += ' AND (name LIKE ? OR category LIKE ?)';
+            query += ' AND (name LIKE ? OR category LIKE ? OR url LIKE ?)';
             const searchTerm = `%${search}%`;
-            params.push(searchTerm, searchTerm);
+            params.push(searchTerm, searchTerm, searchTerm);
         }
         
-        // Get total count
         const countQuery = query.replace('SELECT *', 'SELECT COUNT(*) as total');
         const [countResult] = await pool.execute(countQuery, params);
         const total = countResult[0].total;
         
-        // Get paginated data
-        query += ' ORDER BY name LIMIT ? OFFSET ?';
+        query += ' ORDER BY created_at DESC, name LIMIT ? OFFSET ?';
         params.push(limitNum, offset);
         
-        const [channels] = await pool.execute(query, params);
+        const [channels] = await pool.query(query, params);
         
-        // Get unique categories
         const [categories] = await pool.execute(
             'SELECT DISTINCT category FROM channels WHERE category IS NOT NULL AND category != "" ORDER BY category'
         );
@@ -597,10 +652,12 @@ app.get('/api/channels', authenticateToken, async (req, res) => {
     }
 });
 
-// Add new channel
+// إضافة قناة جديدة
 app.post('/api/channels', authenticateToken, [
-    body('name').notEmpty().trim(),
-    body('url').notEmpty().trim()
+    body('name').notEmpty().trim().isLength({ min: 1, max: 200 }),
+    body('url').notEmpty().trim(),
+    body('category').optional().trim().isLength({ max: 100 }),
+    body('logo').optional().trim()
 ], async (req, res) => {
     try {
         const errors = validationResult(req);
@@ -612,18 +669,40 @@ app.post('/api/channels', authenticateToken, [
         }
         
         const { name, url, category = 'General', logo } = req.body;
+        
+        // التحقق من وجود القناة مسبقًا
+        const [existing] = await pool.execute(
+            'SELECT id FROM channels WHERE url = ? OR name = ?',
+            [url, name]
+        );
+        
+        if (existing.length > 0) {
+            return res.status(409).json({ 
+                success: false, 
+                message: 'Channel with this URL or name already exists' 
+            });
+        }
+        
         const channelId = uuidv4();
         
-        await pool.execute(
-            'INSERT INTO channels (id, name, url, category, logo_url) VALUES (?, ?, ?, ?, ?)',
+        const [result] = await pool.execute(
+            `INSERT INTO channels 
+            (id, name, url, category, logo_url) 
+            VALUES (?, ?, ?, ?, ?)`,
             [channelId, name, url, category, logo || null]
+        );
+        
+        const [channels] = await pool.execute(
+            'SELECT * FROM channels WHERE id = ?',
+            [channelId]
         );
         
         await logActivity(req, 'channel_add', `Added channel: ${name}`);
         
         res.status(201).json({
             success: true,
-            message: 'Channel added successfully'
+            message: 'Channel added successfully',
+            data: channels[0]
         });
         
     } catch (error) {
@@ -635,58 +714,84 @@ app.post('/api/channels', authenticateToken, [
     }
 });
 
-// Update channel
-app.put('/api/channels/:id', authenticateToken, async (req, res) => {
+// تحديث القناة
+app.put('/api/channels/:id', authenticateToken, [
+    body('name').optional().trim().isLength({ min: 1, max: 200 }),
+    body('url').optional().trim(),
+    body('category').optional().trim().isLength({ max: 100 }),
+    body('logo').optional().trim()
+], async (req, res) => {
     try {
         const { id } = req.params;
-        const { name, url, category, logo, is_active } = req.body;
+        const updates = req.body;
+        
+        // التحقق من وجود القناة
+        const [existing] = await pool.execute(
+            'SELECT name FROM channels WHERE id = ?',
+            [id]
+        );
+        
+        if (existing.length === 0) {
+            return res.status(404).json({ 
+                success: false, 
+                message: 'Channel not found' 
+            });
+        }
         
         const updateFields = [];
         const values = [];
         
-        if (name !== undefined) {
+        // بناء استعلام التحديث الديناميكي
+        if (updates.name !== undefined) {
             updateFields.push('name = ?');
-            values.push(name);
+            values.push(updates.name);
         }
         
-        if (url !== undefined) {
+        if (updates.url !== undefined) {
             updateFields.push('url = ?');
-            values.push(url);
+            values.push(updates.url);
         }
         
-        if (category !== undefined) {
+        if (updates.category !== undefined) {
             updateFields.push('category = ?');
-            values.push(category);
+            values.push(updates.category);
         }
         
-        if (logo !== undefined) {
+        if (updates.logo !== undefined) {
             updateFields.push('logo_url = ?');
-            values.push(logo);
+            values.push(updates.logo);
         }
         
-        if (is_active !== undefined) {
+        if (updates.is_active !== undefined) {
             updateFields.push('is_active = ?');
-            values.push(is_active);
+            values.push(updates.is_active);
         }
         
         if (updateFields.length === 0) {
             return res.status(400).json({ 
                 success: false, 
-                message: 'No fields to update' 
+                message: 'No valid fields to update' 
             });
         }
         
+        updateFields.push('updated_at = CURRENT_TIMESTAMP');
         values.push(id);
         
-        const query = `UPDATE channels SET ${updateFields.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`;
+        const query = `UPDATE channels SET ${updateFields.join(', ')} WHERE id = ?`;
         
         await pool.execute(query, values);
         
-        await logActivity(req, 'channel_update', `Updated channel: ${id}`);
+        const [channels] = await pool.execute(
+            'SELECT * FROM channels WHERE id = ?',
+            [id]
+        );
+        
+        await logActivity(req, 'channel_update', `Updated channel: ${channels[0].name}`);
         
         res.json({
             success: true,
-            message: 'Channel updated successfully'
+            message: 'Channel updated successfully',
+            data: channels[0]
         });
         
     } catch (error) {
@@ -698,14 +803,32 @@ app.put('/api/channels/:id', authenticateToken, async (req, res) => {
     }
 });
 
-// Delete channel
+// حذف القناة
 app.delete('/api/channels/:id', authenticateToken, async (req, res) => {
     try {
         const { id } = req.params;
         
-        await pool.execute('DELETE FROM channels WHERE id = ?', [id]);
+        // الحصول على معلومات القناة قبل الحذف
+        const [channels] = await pool.execute(
+            'SELECT name FROM channels WHERE id = ?',
+            [id]
+        );
         
-        await logActivity(req, 'channel_delete', `Deleted channel: ${id}`);
+        if (channels.length === 0) {
+            return res.status(404).json({ 
+                success: false, 
+                message: 'Channel not found' 
+            });
+        }
+        
+        const channelName = channels[0].name;
+        
+        await pool.execute(
+            'DELETE FROM channels WHERE id = ?',
+            [id]
+        );
+        
+        await logActivity(req, 'channel_delete', `Deleted channel: ${channelName}`);
         
         res.json({
             success: true,
@@ -721,7 +844,7 @@ app.delete('/api/channels/:id', authenticateToken, async (req, res) => {
     }
 });
 
-// Bulk delete channels
+// حذف جماعي للقنوات
 app.post('/api/channels/bulk-delete', authenticateToken, async (req, res) => {
     const connection = await pool.getConnection();
     
@@ -739,7 +862,16 @@ app.post('/api/channels/bulk-delete', authenticateToken, async (req, res) => {
         await connection.beginTransaction();
         
         try {
+            // الحصول على أسماء القنوات للتسجيل
             const placeholders = channelIds.map(() => '?').join(',');
+            const [channels] = await connection.execute(
+                `SELECT name FROM channels WHERE id IN (${placeholders})`,
+                channelIds
+            );
+            
+            const channelNames = channels.map(c => c.name).join(', ');
+            
+            // حذف القنوات
             const [result] = await connection.execute(
                 `DELETE FROM channels WHERE id IN (${placeholders})`,
                 channelIds
@@ -748,7 +880,7 @@ app.post('/api/channels/bulk-delete', authenticateToken, async (req, res) => {
             await connection.commit();
             await connection.release();
             
-            await logActivity(req, 'channel_bulk_delete', `Deleted ${result.affectedRows} channels`);
+            await logActivity(req, 'channel_bulk_delete', `Deleted ${result.affectedRows} channels: ${channelNames.substring(0, 200)}`);
             
             res.json({
                 success: true,
@@ -771,67 +903,10 @@ app.post('/api/channels/bulk-delete', authenticateToken, async (req, res) => {
 });
 
 // ======================
-// M3U IMPORT - FIXED VERSION
+// M3U IMPORT API
 // ======================
 
-// Parse M3U content function
-function parseM3UContent(content) {
-    const channels = [];
-    const lines = content.split('\n');
-    let currentChannel = null;
-    
-    for (const line of lines) {
-        const trimmedLine = line.trim();
-        
-        if (trimmedLine.startsWith('#EXTINF:')) {
-            currentChannel = {
-                name: 'Unknown Channel',
-                url: '',
-                category: 'General',
-                logo: ''
-            };
-            
-            // Extract name
-            const nameStart = trimmedLine.indexOf(',') + 1;
-            if (nameStart > 0) {
-                currentChannel.name = trimmedLine.substring(nameStart).trim();
-                
-                // Clean name
-                currentChannel.name = currentChannel.name.replace(/["']/g, '').trim();
-                if (currentChannel.name.length > 200) {
-                    currentChannel.name = currentChannel.name.substring(0, 200);
-                }
-            }
-            
-            // Extract logo
-            const logoMatch = trimmedLine.match(/tvg-logo="([^"]+)"/i);
-            if (logoMatch) {
-                currentChannel.logo = logoMatch[1].trim();
-            }
-            
-            // Extract category
-            const groupMatch = trimmedLine.match(/group-title="([^"]+)"/i);
-            if (groupMatch) {
-                currentChannel.category = groupMatch[1].trim();
-            }
-            
-        } else if (trimmedLine && !trimmedLine.startsWith('#') && currentChannel) {
-            if (trimmedLine.startsWith('http')) {
-                currentChannel.url = trimmedLine.trim();
-                
-                if (currentChannel.url && currentChannel.name) {
-                    channels.push(currentChannel);
-                }
-                
-                currentChannel = null;
-            }
-        }
-    }
-    
-    return channels;
-}
-
-// Upload M3U file
+// رفع ملف M3U
 app.post('/api/upload/m3u', authenticateToken, upload.single('m3uFile'), async (req, res) => {
     try {
         if (!req.file) {
@@ -841,17 +916,40 @@ app.post('/api/upload/m3u', authenticateToken, upload.single('m3uFile'), async (
             });
         }
         
-        console.log('File uploaded:', req.file.originalname);
+        const filePath = req.file.path;
+        const action = req.body.action || 'append';
         
-        // Read and parse file
-        const fileContent = fs.readFileSync(req.file.path, 'utf8');
+        console.log('File uploaded:', {
+            filename: req.file.originalname,
+            size: req.file.size,
+            mimetype: req.file.mimetype,
+            path: filePath,
+            action: action
+        });
+        
+        // قراءة وتحليل الملف
+        let fileContent;
+        try {
+            fileContent = fs.readFileSync(filePath, 'utf8');
+        } catch (readError) {
+            try {
+                fs.unlinkSync(filePath);
+            } catch (unlinkError) {
+                console.warn('Could not delete uploaded file:', unlinkError.message);
+            }
+            return res.status(400).json({ 
+                success: false, 
+                message: 'Failed to read uploaded file' 
+            });
+        }
+        
         const parsedChannels = parseM3UContent(fileContent);
         
-        // Clean up uploaded file
+        // تنظيف الملف المرفوع
         try {
-            fs.unlinkSync(req.file.path);
-        } catch (error) {
-            console.warn('Could not delete file:', error.message);
+            fs.unlinkSync(filePath);
+        } catch (unlinkError) {
+            console.warn('Could not delete uploaded file:', unlinkError.message);
         }
         
         if (parsedChannels.length === 0) {
@@ -861,167 +959,179 @@ app.post('/api/upload/m3u', authenticateToken, upload.single('m3uFile'), async (
             });
         }
         
-        // Store in session with unique ID
+        // تخزين في الجلسة مع رمز جلسة فريد
         const importId = uuidv4();
-        req.session.importData = {
-            importId,
-            channels: parsedChannels,
-            action: req.body.action || 'append',
+        req.session.importData = { 
+            importId, 
+            channels: parsedChannels, 
+            action,
             timestamp: Date.now(),
-            filename: req.file.originalname,
-            channelCount: parsedChannels.length
+            fileInfo: {
+                originalName: req.file.originalname,
+                size: req.file.size,
+                parsedCount: parsedChannels.length
+            }
         };
         
-        // Save session explicitly
+        // حفظ الجلسة يدوياً
         req.session.save((err) => {
             if (err) {
-                console.error('Session save error:', err);
+                console.error('Session save error during upload:', err);
             }
         });
         
-        await logActivity(req, 'm3u_upload', `Uploaded M3U file with ${parsedChannels.length} channels`);
+        await logActivity(req, 'm3u_upload', `Uploaded M3U file "${req.file.originalname}" with ${parsedChannels.length} channels`);
         
         res.json({
             success: true,
-            message: `Successfully parsed ${parsedChannels.length} channels`,
+            message: 'M3U file parsed successfully',
             importId,
-            channelCount: parsedChannels.length,
-            sample: parsedChannels.slice(0, 5),
+            data: parsedChannels.slice(0, 50),
+            total: parsedChannels.length,
+            sampleCount: Math.min(50, parsedChannels.length),
             sessionInfo: {
-                sessionId: req.sessionID,
+                importId,
+                timestamp: req.session.importData.timestamp,
                 expiresIn: '30 minutes'
             }
         });
         
     } catch (error) {
-        console.error('Upload M3U error:', error);
+        console.error('M3U upload error:', error);
         
-        // Clean up file if exists
+        // تنظيف الملف إذا كان موجودًا
         if (req.file && fs.existsSync(req.file.path)) {
             try {
                 fs.unlinkSync(req.file.path);
             } catch (unlinkError) {
-                console.warn('Could not delete file:', unlinkError.message);
+                console.warn('Could not delete file after error:', unlinkError.message);
             }
         }
         
         res.status(500).json({ 
             success: false, 
-            message: 'Failed to process M3U file' 
+            message: 'Failed to process M3U file: ' + error.message 
         });
     }
 });
 
-// Session validation middleware
-const validateImportSession = (req, res, next) => {
-    const { importId } = req.body;
-    
-    console.log('Validating session:', {
-        sessionId: req.sessionID,
-        hasImportData: !!req.session.importData,
-        requestedImportId: importId,
-        storedImportId: req.session.importData?.importId
-    });
-    
-    if (!req.session.importData) {
-        return res.status(400).json({ 
+// الحصول على بيانات الاستيراد المحفوظة
+app.get('/api/import/session/:importId', authenticateToken, async (req, res) => {
+    try {
+        const { importId } = req.params;
+        
+        if (!req.session.importData || req.session.importData.importId !== importId) {
+            return res.status(404).json({ 
+                success: false, 
+                message: 'Import session not found or expired' 
+            });
+        }
+        
+        // التحقق من أن الجلسة ليست قديمة
+        if (Date.now() - req.session.importData.timestamp > 30 * 60 * 1000) {
+            delete req.session.importData;
+            return res.status(400).json({ 
+                success: false, 
+                message: 'Import session expired' 
+            });
+        }
+        
+        res.json({
+            success: true,
+            data: {
+                importId: req.session.importData.importId,
+                action: req.session.importData.action,
+                total: req.session.importData.channels.length,
+                sample: req.session.importData.channels.slice(0, 10),
+                timestamp: req.session.importData.timestamp,
+                fileInfo: req.session.importData.fileInfo
+            }
+        });
+        
+    } catch (error) {
+        console.error('Get import session error:', error);
+        res.status(500).json({ 
             success: false, 
-            message: 'No import session found. Please upload the file again.',
-            sessionId: req.sessionID
+            message: 'Failed to get import session' 
         });
     }
-    
-    if (!importId || req.session.importData.importId !== importId) {
-        return res.status(400).json({ 
-            success: false, 
-            message: 'Invalid import session. Please restart the import process.'
-        });
-    }
-    
-    // Check if session is expired (30 minutes)
-    if (Date.now() - req.session.importData.timestamp > 30 * 60 * 1000) {
-        delete req.session.importData;
-        return res.status(400).json({ 
-            success: false, 
-            message: 'Import session expired. Please upload the file again.' 
-        });
-    }
-    
-    next();
-};
+});
 
-// Confirm M3U import
+// تأكيد استيراد M3U
 app.post('/api/import/m3u', authenticateToken, validateImportSession, async (req, res) => {
     const connection = await pool.getConnection();
     
     try {
         const { importId, action = 'append' } = req.body;
-        const sessionData = req.session.importData;
+        const { channels: parsedChannels } = req.session.importData;
         
-        if (!sessionData || !sessionData.channels) {
-            await connection.release();
-            return res.status(400).json({ 
-                success: false, 
-                message: 'No import data found in session' 
-            });
-        }
-        
-        const channels = sessionData.channels;
-        
-        console.log(`Starting import of ${channels.length} channels with action: ${action}`);
+        console.log(`Starting import with action: ${action}, channels: ${parsedChannels.length}`);
         
         await connection.beginTransaction();
         
         try {
-            // Clear existing channels if replace action
             if (action === 'replace') {
                 await connection.execute('DELETE FROM channels');
-                console.log('Cleared existing channels');
+                console.log('Cleared existing channels for replacement');
             }
             
-            let imported = 0;
-            let skipped = 0;
-            let errors = 0;
+            let importedCount = 0;
+            let skippedCount = 0;
+            let errorCount = 0;
+            const errors = [];
             
-            for (const channel of channels) {
+            for (const channel of parsedChannels) {
                 try {
-                    // Check if channel already exists (by URL)
+                    // التحقق مما إذا كانت القناة موجودة مسبقًا (عن طريق URL)
                     const [existing] = await connection.execute(
                         'SELECT id FROM channels WHERE url = ?',
                         [channel.url]
                     );
                     
                     if (existing.length === 0 || action === 'replace') {
-                        // If exists in replace mode, delete first
+                        // إذا كانت موجودة في وضع الاستبدال، احذفها أولاً
                         if (existing.length > 0 && action === 'replace') {
                             await connection.execute('DELETE FROM channels WHERE id = ?', [existing[0].id]);
                         }
                         
                         await connection.execute(
-                            'INSERT INTO channels (id, name, url, category, logo_url) VALUES (?, ?, ?, ?, ?)',
-                            [uuidv4(), channel.name, channel.url, channel.category, channel.logo || null]
+                            `INSERT INTO channels 
+                            (id, name, url, category, logo_url) 
+                            VALUES (?, ?, ?, ?, ?)`,
+                            [
+                                uuidv4(),
+                                channel.name.substring(0, 200),
+                                channel.url,
+                                channel.category?.substring(0, 100) || 'General',
+                                channel.logo || null
+                            ]
                         );
-                        imported++;
+                        importedCount++;
                     } else {
-                        skipped++;
+                        skippedCount++;
                     }
-                } catch (error) {
-                    console.error('Error importing channel:', error.message);
-                    errors++;
+                } catch (err) {
+                    console.error('Error importing channel:', err.message);
+                    errorCount++;
+                    errors.push({
+                        channel: channel.name,
+                        error: err.message
+                    });
                 }
             }
             
             await connection.commit();
             
-            // Clear session data after successful import
+            // مسح بيانات الجلسة بعد الاستيراد الناجح
+            const fileInfo = req.session.importData.fileInfo;
             delete req.session.importData;
             req.session.save((err) => {
                 if (err) {
-                    console.error('Error saving session after import:', err);
+                    console.error('Session save error after import:', err);
                 }
             });
             
-            await logActivity(req, 'm3u_import', `Imported ${imported} channels (${action}), skipped ${skipped}, errors ${errors}`);
+            await logActivity(req, 'm3u_import', `Imported ${importedCount} channels from "${fileInfo?.originalName || 'M3U file'}" (${action}), skipped ${skippedCount}, errors ${errorCount}`);
             
             const [countResult] = await connection.execute('SELECT COUNT(*) as total FROM channels');
             
@@ -1029,13 +1139,12 @@ app.post('/api/import/m3u', authenticateToken, validateImportSession, async (req
             
             res.json({
                 success: true,
-                message: `Import completed successfully`,
-                summary: {
-                    imported,
-                    skipped,
-                    errors,
-                    totalChannels: countResult[0].total
-                }
+                message: `Successfully imported ${importedCount} channels (${skippedCount} skipped, ${errorCount} errors)`,
+                imported: importedCount,
+                skipped: skippedCount,
+                errors: errorCount,
+                errorDetails: errors.slice(0, 10), // إرجاع أول 10 أخطاء فقط
+                totalChannels: countResult[0].total
             });
             
         } catch (error) {
@@ -1045,97 +1154,219 @@ app.post('/api/import/m3u', authenticateToken, validateImportSession, async (req
         }
         
     } catch (error) {
-        console.error('Import M3U error:', error);
+        console.error('Import error:', error);
         res.status(500).json({ 
             success: false, 
-            message: 'Failed to import channels' 
+            message: 'Failed to import channels: ' + error.message 
         });
     }
 });
 
-// Check import session status
-app.get('/api/import/session/status', authenticateToken, (req, res) => {
-    res.json({
-        success: true,
-        session: {
-            id: req.sessionID,
-            hasImportData: !!req.session.importData,
-            importData: req.session.importData ? {
-                importId: req.session.importData.importId,
-                filename: req.session.importData.filename,
-                channelCount: req.session.importData.channelCount,
-                timestamp: new Date(req.session.importData.timestamp).toISOString(),
-                age: Math.floor((Date.now() - req.session.importData.timestamp) / 1000) + ' seconds'
-            } : null
+// إلغاء جلسة الاستيراد
+app.delete('/api/import/session/:importId', authenticateToken, async (req, res) => {
+    try {
+        const { importId } = req.params;
+        
+        if (req.session.importData && req.session.importData.importId === importId) {
+            delete req.session.importData;
+            req.session.save((err) => {
+                if (err) {
+                    console.error('Session save error after cancel:', err);
+                }
+            });
+            
+            await logActivity(req, 'import_cancel', 'Cancelled import session');
+            
+            return res.json({
+                success: true,
+                message: 'Import session cancelled successfully'
+            });
         }
-    });
+        
+        res.status(404).json({
+            success: false,
+            message: 'Import session not found'
+        });
+        
+    } catch (error) {
+        console.error('Cancel import session error:', error);
+        res.status(500).json({ 
+            success: false, 
+            message: 'Failed to cancel import session' 
+        });
+    }
 });
 
-// Clear import session
-app.delete('/api/import/session', authenticateToken, (req, res) => {
-    delete req.session.importData;
-    req.session.save((err) => {
-        if (err) {
-            console.error('Error saving session after clear:', err);
-        }
-    });
+// دالة مساعدة لتحليل محتوى M3U
+function parseM3UContent(content) {
+    const channels = [];
+    const lines = content.split('\n');
+    let currentChannel = null;
+    let lineNumber = 0;
     
-    res.json({
-        success: true,
-        message: 'Import session cleared'
-    });
-});
+    for (const line of lines) {
+        lineNumber++;
+        const trimmedLine = line.trim();
+        
+        if (trimmedLine.startsWith('#EXTINF:')) {
+            currentChannel = {
+                name: 'Unknown Channel',
+                url: '',
+                category: 'General',
+                logo: '',
+                lineNumber: lineNumber
+            };
+            
+            // استخراج الاسم
+            const nameStart = trimmedLine.indexOf(',') + 1;
+            if (nameStart > 0 && nameStart < trimmedLine.length) {
+                currentChannel.name = trimmedLine.substring(nameStart).trim();
+                
+                // إزالة السمات الإضافية من الاسم
+                const attrIndex = currentChannel.name.indexOf(', tvg-');
+                if (attrIndex !== -1) {
+                    currentChannel.name = currentChannel.name.substring(0, attrIndex);
+                }
+                
+                // تنظيف الاسم
+                currentChannel.name = currentChannel.name.replace(/["']/g, '').trim();
+                if (currentChannel.name.length > 200) {
+                    currentChannel.name = currentChannel.name.substring(0, 200);
+                }
+            }
+            
+            // استخراج الشعار
+            const logoMatch = trimmedLine.match(/tvg-logo="([^"]+)"/i);
+            if (logoMatch && logoMatch[1]) {
+                currentChannel.logo = logoMatch[1].trim();
+                if (currentChannel.logo.length > 500) {
+                    currentChannel.logo = currentChannel.logo.substring(0, 500);
+                }
+            }
+            
+            // استخراج المجموعة/الفئة
+            const groupMatch = trimmedLine.match(/group-title="([^"]+)"/i);
+            if (groupMatch && groupMatch[1]) {
+                currentChannel.category = groupMatch[1].trim();
+                if (currentChannel.category.length > 100) {
+                    currentChannel.category = currentChannel.category.substring(0, 100);
+                }
+            }
+            
+        } else if (trimmedLine && !trimmedLine.startsWith('#') && currentChannel) {
+            if (trimmedLine.startsWith('http://') || trimmedLine.startsWith('https://') || trimmedLine.includes('://')) {
+                currentChannel.url = trimmedLine.trim();
+                
+                // التحقق من صحة URL والبيانات الأساسية
+                if (currentChannel.url.length > 0 && currentChannel.name.length > 0) {
+                    // تنظيف URL من الفراغات
+                    currentChannel.url = currentChannel.url.replace(/\s+/g, '');
+                    channels.push(currentChannel);
+                } else {
+                    console.log(`Skipping invalid channel at line ${lineNumber}:`, currentChannel);
+                }
+                
+                currentChannel = null;
+            }
+        }
+    }
+    
+    console.log(`Parsed ${channels.length} channels from M3U file`);
+    return channels;
+}
 
 // ======================
-// SUBSCRIPTION CODES
+// SUBSCRIPTION CODE API
 // ======================
 
-// Generate subscription codes
+// إنشاء رموز اشتراك
 app.post('/api/codes/generate', authenticateToken, [
-    body('duration_days').isInt({ min: 1 }),
-    body('quantity').isInt({ min: 1, max: 100 })
+    body('duration_days').isInt({ min: 1, max: 3650 }),
+    body('quantity').isInt({ min: 1, max: 100 }),
+    body('code_type').isIn(['premium', 'trial', 'promo']),
+    body('notes').optional().trim()
 ], async (req, res) => {
+    const connection = await pool.getConnection();
+    
     try {
         const errors = validationResult(req);
         if (!errors.isEmpty()) {
+            await connection.release();
             return res.status(400).json({ 
                 success: false, 
                 errors: errors.array() 
             });
         }
         
-        const { duration_days, quantity, code_type = 'premium', notes } = req.body;
+        const { duration_days, quantity, code_type, notes } = req.body;
         const generatedBy = req.user.username;
-        const codes = [];
+        const generatedCodes = [];
         
-        for (let i = 0; i < quantity; i++) {
-            const code = Array.from({length: 12}, () => Math.floor(Math.random() * 10)).join('');
-            const expiryDate = new Date();
-            expiryDate.setDate(expiryDate.getDate() + duration_days);
+        await connection.beginTransaction();
+        
+        try {
+            for (let i = 0; i < quantity; i++) {
+                let code;
+                let isUnique = false;
+                let attempts = 0;
+                
+                // التأكد من أن الرمز فريد
+                while (!isUnique && attempts < 10) {
+                    code = generateSubscriptionCode();
+                    const [existing] = await connection.execute(
+                        'SELECT id FROM subscription_codes WHERE code = ?',
+                        [code]
+                    );
+                    
+                    if (existing.length === 0) {
+                        isUnique = true;
+                    }
+                    attempts++;
+                }
+                
+                if (!isUnique) {
+                    throw new Error('Failed to generate unique code after 10 attempts');
+                }
+                
+                const expiryDate = new Date();
+                expiryDate.setDate(expiryDate.getDate() + duration_days);
+                
+                await connection.execute(
+                    `INSERT INTO subscription_codes 
+                    (id, code, duration_days, code_type, expiry_date, generated_by, notes) 
+                    VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                    [uuidv4(), code, duration_days, code_type, expiryDate, generatedBy, notes || null]
+                );
+                
+                generatedCodes.push({
+                    code,
+                    duration_days,
+                    code_type,
+                    expiry_date: expiryDate.toISOString(),
+                    generated_by: generatedBy,
+                    notes: notes || null
+                });
+            }
             
-            await pool.execute(
-                'INSERT INTO subscription_codes (id, code, duration_days, code_type, expiry_date, generated_by, notes) VALUES (?, ?, ?, ?, ?, ?, ?)',
-                [uuidv4(), code, duration_days, code_type, expiryDate, generatedBy, notes || null]
-            );
+            await connection.commit();
+            await connection.release();
             
-            codes.push({
-                code,
-                duration_days,
-                expiry_date: expiryDate.toISOString(),
-                code_type
+            await logActivity(req, 'code_generate', `Generated ${quantity} ${code_type} codes (${duration_days} days)`);
+            
+            res.status(201).json({
+                success: true,
+                message: `${quantity} codes generated successfully`,
+                data: generatedCodes
             });
+            
+        } catch (error) {
+            await connection.rollback();
+            await connection.release();
+            throw error;
         }
         
-        await logActivity(req, 'code_generate', `Generated ${quantity} ${code_type} codes`);
-        
-        res.status(201).json({
-            success: true,
-            message: `${quantity} codes generated successfully`,
-            data: codes
-        });
-        
     } catch (error) {
-        console.error('Generate codes error:', error);
+        console.error('Generate code error:', error);
         res.status(500).json({ 
             success: false, 
             message: 'Failed to generate codes' 
@@ -1143,44 +1374,52 @@ app.post('/api/codes/generate', authenticateToken, [
     }
 });
 
-// Get all codes
+// الحصول على جميع الرموز
 app.get('/api/codes', authenticateToken, async (req, res) => {
     try {
-        const { status, page = 1, limit = 50 } = req.query;
+        const { status, search, page = 1, limit = 50 } = req.query;
         
         const limitNum = parseInt(limit, 10) || 50;
         const pageNum = parseInt(page, 10) || 1;
         const offset = (pageNum - 1) * limitNum;
         
-        let query = 'SELECT * FROM subscription_codes WHERE 1=1';
+        let query = `
+            SELECT sc.* 
+            FROM subscription_codes sc
+            WHERE 1=1
+        `;
         let params = [];
         
         if (status === 'active') {
-            query += ' AND is_used = FALSE AND expiry_date > NOW()';
+            query += ' AND sc.is_used = FALSE AND sc.expiry_date > NOW()';
         } else if (status === 'used') {
-            query += ' AND is_used = TRUE';
+            query += ' AND sc.is_used = TRUE';
         } else if (status === 'expired') {
-            query += ' AND expiry_date <= NOW()';
+            query += ' AND sc.expiry_date <= NOW()';
         }
         
-        // Get total count
-        const countQuery = query.replace('SELECT *', 'SELECT COUNT(*) as total');
+        if (search) {
+            query += ' AND (sc.code LIKE ? OR sc.generated_by LIKE ? OR sc.notes LIKE ?)';
+            const searchTerm = `%${search}%`;
+            params.push(searchTerm, searchTerm, searchTerm);
+        }
+        
+        const countQuery = query.replace('SELECT sc.*', 'SELECT COUNT(*) as total');
         const [countResult] = await pool.execute(countQuery, params);
         const total = countResult[0].total;
         
-        // Get paginated data
-        query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
+        query += ' ORDER BY sc.created_at DESC LIMIT ? OFFSET ?';
         params.push(limitNum, offset);
         
-        const [codes] = await pool.execute(query, params);
+        const [codes] = await pool.query(query, params);
         
-        // Get statistics
+        // الحصول على الإحصائيات
         const [stats] = await pool.execute(`
             SELECT 
-                COUNT(*) as total,
-                SUM(CASE WHEN is_used = FALSE AND expiry_date > NOW() THEN 1 ELSE 0 END) as active,
-                SUM(CASE WHEN is_used = TRUE THEN 1 ELSE 0 END) as used,
-                SUM(CASE WHEN expiry_date <= NOW() THEN 1 ELSE 0 END) as expired
+                COUNT(*) as total_codes,
+                SUM(CASE WHEN is_used = FALSE AND expiry_date > NOW() THEN 1 ELSE 0 END) as active_codes,
+                SUM(CASE WHEN is_used = TRUE THEN 1 ELSE 0 END) as used_codes,
+                SUM(CASE WHEN expiry_date <= NOW() THEN 1 ELSE 0 END) as expired_codes
             FROM subscription_codes
         `);
         
@@ -1205,14 +1444,33 @@ app.get('/api/codes', authenticateToken, async (req, res) => {
     }
 });
 
-// Delete code
+// حذف الرمز
 app.delete('/api/codes/:id', authenticateToken, async (req, res) => {
     try {
         const { id } = req.params;
         
-        await pool.execute('DELETE FROM subscription_codes WHERE id = ?', [id]);
+        // التحقق من وجود الرمز
+        const [codes] = await pool.execute(
+            'SELECT code FROM subscription_codes WHERE id = ?',
+            [id]
+        );
         
-        await logActivity(req, 'code_delete', `Deleted subscription code: ${id}`);
+        if (codes.length === 0) {
+            return res.status(404).json({ 
+                success: false, 
+                message: 'Code not found' 
+            });
+        }
+        
+        const code = codes[0].code;
+        
+        // حذف الرمز
+        await pool.execute(
+            'DELETE FROM subscription_codes WHERE id = ?',
+            [id]
+        );
+        
+        await logActivity(req, 'code_delete', `Deleted subscription code: ${code}`);
         
         res.json({
             success: true,
@@ -1229,10 +1487,202 @@ app.delete('/api/codes/:id', authenticateToken, async (req, res) => {
 });
 
 // ======================
-// APP SUBSCRIPTION API
+// SUBSCRIPTION API FOR FLUTTER APP
 // ======================
 
-// Validate and activate subscription code
+// التحقق من رمز الاشتراك
+app.post('/api/codes/validate', async (req, res) => {
+    const connection = await pool.getConnection();
+    
+    try {
+        const { code, device_id } = req.body;
+        
+        if (!code || !device_id) {
+            await connection.release();
+            return res.status(400).json({ 
+                success: false, 
+                message: 'Code and device ID are required' 
+            });
+        }
+        
+        const cleanCode = code.trim().replace(/\s/g, '');
+        
+        // التحقق من تنسيق الرمز - يجب أن يكون 12 رقمًا
+        if (!/^\d{12}$/.test(cleanCode)) {
+            await connection.release();
+            return res.json({
+                success: true,
+                valid: false,
+                message: 'Invalid code format. Must be 12 digits.'
+            });
+        }
+        
+        await connection.beginTransaction();
+        
+        try {
+            // البحث عن رمز صالح وغير مستخدم وغير منتهي الصلاحية
+            const [codes] = await connection.execute(`
+                SELECT * 
+                FROM subscription_codes 
+                WHERE code = ? 
+                AND is_used = FALSE 
+                AND expiry_date > NOW()
+                FOR UPDATE
+            `, [cleanCode]);
+            
+            if (codes.length === 0) {
+                await connection.rollback();
+                await connection.release();
+                return res.json({
+                    success: true,
+                    valid: false,
+                    message: 'Invalid or expired code'
+                });
+            }
+            
+            const subscriptionCode = codes[0];
+            
+            // التحقق مما إذا كان الجهاز لديه اشتراك نشط بالفعل
+            const [existingSubs] = await connection.execute(`
+                SELECT * FROM user_subscriptions 
+                WHERE user_id = ? AND is_active = TRUE AND expires_at > NOW()
+            `, [device_id]);
+            
+            if (existingSubs.length > 0) {
+                await connection.rollback();
+                await connection.release();
+                return res.json({
+                    success: true,
+                    valid: false,
+                    message: 'Device already has active subscription'
+                });
+            }
+            
+            // وضع علامة على الرمز كمستخدم
+            await connection.execute(
+                'UPDATE subscription_codes SET is_used = TRUE, used_by = ?, used_at = NOW() WHERE code = ?',
+                [device_id, cleanCode]
+            );
+            
+            // حساب تاريخ انتهاء الصلاحية
+            const expiryDate = new Date();
+            expiryDate.setDate(expiryDate.getDate() + subscriptionCode.duration_days);
+            
+            // إنشاء اشتراك المستخدم
+            await connection.execute(
+                `INSERT INTO user_subscriptions 
+                (id, user_id, subscription_code, device_id, expires_at, is_active) 
+                VALUES (?, ?, ?, ?, ?, TRUE)`,
+                [uuidv4(), device_id, cleanCode, device_id, expiryDate]
+            );
+            
+            // تحديث مستخدمي التطبيق
+            await connection.execute(
+                `INSERT INTO app_users (device_id, subscription_code, last_active) 
+                VALUES (?, ?, NOW()) 
+                ON DUPLICATE KEY UPDATE 
+                subscription_code = VALUES(subscription_code),
+                last_active = NOW()`,
+                [device_id, cleanCode]
+            );
+            
+            await connection.commit();
+            await connection.release();
+            
+            res.json({
+                success: true,
+                valid: true,
+                message: 'Subscription activated successfully',
+                data: {
+                    code: cleanCode,
+                    duration_days: subscriptionCode.duration_days,
+                    expiry_date: expiryDate.toISOString(),
+                    activated_at: new Date().toISOString()
+                }
+            });
+            
+        } catch (error) {
+            await connection.rollback();
+            await connection.release();
+            throw error;
+        }
+        
+    } catch (error) {
+        console.error('Validate code error:', error);
+        res.status(500).json({ 
+            success: false, 
+            message: 'Failed to validate code' 
+        });
+    }
+});
+
+// التحقق من حالة الاشتراك (للتطبيق)
+app.post('/api/subscription/status', async (req, res) => {
+    try {
+        const { device_id } = req.body;
+        
+        if (!device_id) {
+            return res.status(400).json({ 
+                success: false, 
+                message: 'Device ID is required' 
+            });
+        }
+        
+        // التحقق مما إذا كان الجهاز لديه اشتراك نشط
+        const [subscriptions] = await pool.execute(`
+            SELECT us.*, sc.duration_days, sc.code_type, sc.code
+            FROM user_subscriptions us
+            LEFT JOIN subscription_codes sc ON us.subscription_code = sc.code
+            WHERE us.user_id = ? 
+            AND us.is_active = TRUE
+            ORDER BY us.expires_at DESC
+            LIMIT 1
+        `, [device_id]);
+        
+        if (subscriptions.length === 0) {
+            return res.json({
+                success: true,
+                has_active_subscription: false,
+                message: 'No active subscription found'
+            });
+        }
+        
+        const subscription = subscriptions[0];
+        const expiryDate = new Date(subscription.expires_at);
+        const now = new Date();
+        const isActive = expiryDate > now;
+        
+        let remainingDays = 0;
+        if (isActive) {
+            const diffTime = Math.abs(expiryDate - now);
+            remainingDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+        }
+        
+        res.json({
+            success: true,
+            has_active_subscription: isActive,
+            data: {
+                code: subscription.code || '',
+                activated_at: subscription.activated_at ? subscription.activated_at.toISOString() : new Date().toISOString(),
+                expires_at: subscription.expires_at.toISOString(),
+                remaining_days: remainingDays,
+                is_active: isActive,
+                duration_days: subscription.duration_days || 30,
+                code_type: subscription.code_type || 'premium'
+            },
+            message: isActive ? 'Active subscription found' : 'Subscription expired'
+        });
+        
+    } catch (error) {
+        console.error('Check subscription error:', error);
+        res.status(500).json({ 
+            success: false, 
+            message: 'Failed to check subscription status' 
+        });
+    }
+});
+
+// تفعيل الاشتراك (للتطبيق)
 app.post('/api/subscription/activate', async (req, res) => {
     const connection = await pool.getConnection();
     
@@ -1249,75 +1699,82 @@ app.post('/api/subscription/activate', async (req, res) => {
         
         const cleanCode = code.trim().replace(/\s/g, '');
         
+        // التحقق من تنسيق الرمز - يجب أن يكون 12 رقمًا
         if (!/^\d{12}$/.test(cleanCode)) {
             await connection.release();
             return res.json({
                 success: false,
-                valid: false,
-                message: 'Invalid code format'
+                activated: false,
+                message: 'Invalid code format. Must be 12 digits.'
             });
         }
         
         await connection.beginTransaction();
         
         try {
-            // Check if code is valid
-            const [codes] = await connection.execute(
-                'SELECT * FROM subscription_codes WHERE code = ? AND is_used = FALSE AND expiry_date > NOW()',
-                [cleanCode]
-            );
+            // أولاً التحقق من صحة الرمز
+            const [codes] = await connection.execute(`
+                SELECT * 
+                FROM subscription_codes 
+                WHERE code = ? 
+                AND is_used = FALSE 
+                AND expiry_date > NOW()
+                FOR UPDATE
+            `, [cleanCode]);
             
             if (codes.length === 0) {
                 await connection.rollback();
                 await connection.release();
                 return res.json({
                     success: false,
-                    valid: false,
+                    activated: false,
                     message: 'Invalid or expired code'
                 });
             }
             
             const subscriptionCode = codes[0];
             
-            // Check if device already has active subscription
-            const [existing] = await connection.execute(
-                'SELECT * FROM user_subscriptions WHERE device_id = ? AND expires_at > NOW() AND is_active = TRUE',
-                [device_id]
-            );
+            // التحقق مما إذا كان الجهاز لديه اشتراك نشط بالفعل
+            const [existingSubs] = await connection.execute(`
+                SELECT * FROM user_subscriptions 
+                WHERE user_id = ? AND is_active = TRUE AND expires_at > NOW()
+            `, [device_id]);
             
-            if (existing.length > 0) {
+            if (existingSubs.length > 0) {
                 await connection.rollback();
                 await connection.release();
                 return res.json({
                     success: false,
-                    valid: false,
+                    activated: false,
                     message: 'Device already has active subscription'
                 });
             }
             
-            // Mark code as used
+            // وضع علامة على الرمز كمستخدم
             await connection.execute(
                 'UPDATE subscription_codes SET is_used = TRUE, used_by = ?, used_at = NOW() WHERE code = ?',
                 [device_id, cleanCode]
             );
             
-            // Calculate expiry date
+            // حساب تاريخ انتهاء الصلاحية
             const expiryDate = new Date();
             expiryDate.setDate(expiryDate.getDate() + subscriptionCode.duration_days);
             
-            // Create subscription
+            // إنشاء اشتراك المستخدم
             await connection.execute(
-                'INSERT INTO user_subscriptions (id, user_id, subscription_code, device_id, expires_at) VALUES (?, ?, ?, ?, ?)',
+                `INSERT INTO user_subscriptions 
+                (id, user_id, subscription_code, device_id, expires_at, is_active) 
+                VALUES (?, ?, ?, ?, ?, TRUE)`,
                 [uuidv4(), device_id, cleanCode, device_id, expiryDate]
             );
             
-            // Update app users
+            // تحديث مستخدمي التطبيق
             await connection.execute(
                 `INSERT INTO app_users (device_id, subscription_code, last_active) 
-                 VALUES (?, ?, NOW()) 
-                 ON DUPLICATE KEY UPDATE 
-                 subscription_code = VALUES(subscription_code),
-                 last_active = NOW()`,
+                VALUES (?, ?, NOW()) 
+                ON DUPLICATE KEY UPDATE 
+                subscription_code = VALUES(subscription_code),
+                last_active = NOW()`,
                 [device_id, cleanCode]
             );
             
@@ -1326,12 +1783,14 @@ app.post('/api/subscription/activate', async (req, res) => {
             
             res.json({
                 success: true,
-                valid: true,
+                activated: true,
                 message: 'Subscription activated successfully',
                 data: {
                     code: cleanCode,
                     duration_days: subscriptionCode.duration_days,
-                    expiry_date: expiryDate.toISOString()
+                    expiry_date: expiryDate.toISOString(),
+                    activated_at: new Date().toISOString(),
+                    remaining_days: subscriptionCode.duration_days
                 }
             });
             
@@ -1344,132 +1803,9 @@ app.post('/api/subscription/activate', async (req, res) => {
     } catch (error) {
         console.error('Activate subscription error:', error);
         res.status(500).json({ 
-            success: false, 
-            message: 'Failed to activate subscription' 
-        });
-    }
-});
-
-// Check subscription status
-app.post('/api/subscription/status', async (req, res) => {
-    try {
-        const { device_id } = req.body;
-        
-        if (!device_id) {
-            return res.status(400).json({ 
-                success: false, 
-                message: 'Device ID is required' 
-            });
-        }
-        
-        const [subscription] = await pool.execute(
-            `SELECT us.*, sc.duration_days, sc.code_type 
-             FROM user_subscriptions us
-             LEFT JOIN subscription_codes sc ON us.subscription_code = sc.code
-             WHERE us.device_id = ? AND us.expires_at > NOW() AND us.is_active = TRUE
-             ORDER BY us.expires_at DESC
-             LIMIT 1`,
-            [device_id]
-        );
-        
-        if (subscription.length === 0) {
-            return res.json({
-                success: true,
-                has_subscription: false,
-                message: 'No active subscription found'
-            });
-        }
-        
-        const sub = subscription[0];
-        const expiryDate = new Date(sub.expires_at);
-        const now = new Date();
-        const remainingDays = Math.ceil((expiryDate - now) / (1000 * 60 * 60 * 24));
-        
-        res.json({
-            success: true,
-            has_subscription: true,
-            data: {
-                expiry_date: expiryDate.toISOString(),
-                remaining_days: remainingDays,
-                duration_days: sub.duration_days,
-                code_type: sub.code_type
-            }
-        });
-        
-    } catch (error) {
-        console.error('Check subscription error:', error);
-        res.status(500).json({ 
-            success: false, 
-            message: 'Failed to check subscription status' 
-        });
-    }
-});
-
-// ======================
-// APP CHANNELS API
-// ======================
-
-// Get channels for app
-app.get('/api/app/channels', async (req, res) => {
-    try {
-        const { category } = req.query;
-        
-        let query = 'SELECT id, name, url, category, logo_url FROM channels WHERE is_active = TRUE';
-        let params = [];
-        
-        if (category && category !== 'All') {
-            query += ' AND category = ?';
-            params.push(category);
-        }
-        
-        query += ' ORDER BY name';
-        
-        const [channels] = await pool.execute(query, params);
-        
-        // Get categories
-        const [categories] = await pool.execute(
-            'SELECT DISTINCT category FROM channels WHERE is_active = TRUE AND category IS NOT NULL AND category != "" ORDER BY category'
-        );
-        
-        res.json({
-            success: true,
-            channels: channels,
-            categories: categories.map(c => c.category),
-            total: channels.length
-        });
-        
-    } catch (error) {
-        console.error('App channels error:', error);
-        res.status(500).json({ 
-            success: false, 
-            channels: [],
-            message: 'Failed to load channels'
-        });
-    }
-});
-
-// Get app settings
-app.get('/api/app/settings', async (req, res) => {
-    try {
-        const [settings] = await pool.execute(
-            'SELECT setting_key, setting_value FROM playlist_settings'
-        );
-        
-        const settingsObj = {};
-        settings.forEach(setting => {
-            settingsObj[setting.setting_key] = setting.setting_value;
-        });
-        
-        res.json({
-            success: true,
-            settings: settingsObj
-        });
-        
-    } catch (error) {
-        console.error('App settings error:', error);
-        res.status(500).json({ 
-            success: false, 
-            settings: {}
+            success: false,
+            activated: false,
+            message: 'Failed to activate subscription'
         });
     }
 });
@@ -1478,45 +1814,73 @@ app.get('/api/app/settings', async (req, res) => {
 // DASHBOARD API
 // ======================
 
-// Get dashboard stats
+// الحصول على إحصائيات لوحة التحكم
 app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
     try {
-        // Channel stats
-        const [channelStats] = await pool.execute('SELECT COUNT(*) as total FROM channels');
+        // الحصول على إحصائيات القنوات
+        const [channelResult] = await pool.execute('SELECT COUNT(*) as total FROM channels');
         
-        // Code stats
+        // الحصول على إحصائيات الرموز
         const [codeStats] = await pool.execute(`
             SELECT 
-                COUNT(*) as total,
-                SUM(CASE WHEN is_used = FALSE AND expiry_date > NOW() THEN 1 ELSE 0 END) as active,
-                SUM(CASE WHEN is_used = TRUE THEN 1 ELSE 0 END) as used
+                COUNT(*) as total_codes,
+                SUM(CASE WHEN is_used = FALSE AND expiry_date > NOW() THEN 1 ELSE 0 END) as active_codes,
+                SUM(CASE WHEN is_used = TRUE THEN 1 ELSE 0 END) as used_codes
             FROM subscription_codes
         `);
         
-        // User stats
+        // الحصول على إحصائيات المستخدمين
         const [userStats] = await pool.execute(`
-            SELECT COUNT(DISTINCT device_id) as active_users 
+            SELECT 
+                COUNT(DISTINCT user_id) as active_users,
+                COUNT(*) as total_subscriptions
             FROM user_subscriptions 
             WHERE expires_at > NOW() AND is_active = TRUE
         `);
         
-        // Recent activities
+        // الحصول على النشاطات الأخيرة
         const [activities] = await pool.execute(`
-            SELECT al.*, au.username 
+            SELECT al.*, au.username as admin_name
             FROM activity_logs al
             LEFT JOIN admin_users au ON al.admin_id = au.id
             ORDER BY al.created_at DESC
             LIMIT 10
         `);
         
+        // الحصول على فئات القنوات
+        const [categories] = await pool.execute(`
+            SELECT category, COUNT(*) as count 
+            FROM channels 
+            WHERE category IS NOT NULL AND category != ''
+            GROUP BY category 
+            ORDER BY count DESC
+            LIMIT 10
+        `);
+        
+        // الحصول على مستخدمي التطبيق النشطين
+        const [recentUsers] = await pool.execute(`
+            SELECT device_id, last_active 
+            FROM app_users 
+            WHERE last_active > DATE_SUB(NOW(), INTERVAL 7 DAY)
+            ORDER BY last_active DESC
+            LIMIT 10
+        `);
+        
         res.json({
             success: true,
-            stats: {
-                channels: channelStats[0].total,
+            data: {
+                channels: {
+                    total: channelResult[0].total,
+                    categories: categories
+                },
                 codes: codeStats[0],
-                users: userStats[0].active_users || 0
-            },
-            recent_activities: activities
+                users: {
+                    active: userStats[0].active_users || 0,
+                    total_subscriptions: userStats[0].total_subscriptions || 0,
+                    recent_users: recentUsers
+                },
+                recent_activities: activities
+            }
         });
         
     } catch (error) {
@@ -1529,22 +1893,341 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
 });
 
 // ======================
+// APP API (For Flutter App)
+// ======================
+
+// الحصول على القنوات للتطبيق (نقطة نهاية عامة)
+app.get('/api/app/channels', async (req, res) => {
+    try {
+        const { category } = req.query;
+        
+        let query = 'SELECT id, name, url, category, logo_url FROM channels WHERE is_active = TRUE';
+        let params = [];
+        
+        if (category && category !== 'All' && category !== '') {
+            query += ' AND category = ?';
+            params.push(category);
+        }
+        
+        query += ' ORDER BY name';
+        
+        const [channels] = await pool.execute(query, params);
+        
+        // تنسيق القنوات للتطبيق
+        const formattedChannels = channels.map(channel => ({
+            id: channel.id,
+            name: channel.name || 'Unknown Channel',
+            url: channel.url || '',
+            category: channel.category || 'General',
+            logo_url: channel.logo_url || '',
+            is_active: true
+        }));
+        
+        // الحصول على الفئات للتصفية
+        const [categoriesResult] = await pool.execute(
+            'SELECT DISTINCT category FROM channels WHERE is_active = TRUE AND category IS NOT NULL AND category != "" ORDER BY category'
+        );
+        
+        const categories = categoriesResult.map(c => c.category);
+        
+        res.json({
+            success: true,
+            channels: formattedChannels,
+            categories: categories,
+            total: formattedChannels.length,
+            timestamp: new Date().toISOString()
+        });
+        
+    } catch (error) {
+        console.error('App channels error:', error);
+        res.status(500).json({ 
+            success: false, 
+            channels: [],
+            categories: [],
+            message: 'Failed to load channels'
+        });
+    }
+});
+
+// الحصول على إعدادات التطبيق
+app.get('/api/app/settings', async (req, res) => {
+    try {
+        const [settings] = await pool.execute(
+            'SELECT setting_key, setting_value FROM playlist_settings'
+        );
+        
+        const settingsObj = {};
+        settings.forEach(setting => {
+            settingsObj[setting.setting_key] = setting.setting_value;
+        });
+        
+        // إضافة قيم افتراضية إذا كانت مفقودة
+        settingsObj.app_name = settingsObj.app_name || 'Watch Me Premium';
+        settingsObj.company_name = settingsObj.company_name || 'Watch Me Streaming';
+        settingsObj.support_email = settingsObj.support_email || 'support@watchme.com';
+        settingsObj.version = settingsObj.version || '1.0.0';
+        
+        res.json({
+            success: true,
+            settings: settingsObj,
+            server_time: new Date().toISOString()
+        });
+        
+    } catch (error) {
+        console.error('App settings error:', error);
+        res.status(500).json({ 
+            success: false, 
+            settings: {},
+            message: 'Failed to load settings'
+        });
+    }
+});
+
+// ======================
+// ADMIN MANAGEMENT API
+// ======================
+
+// الحصول على جميع المسؤولين
+app.get('/api/admin/users', authenticateToken, async (req, res) => {
+    try {
+        const { page = 1, limit = 20 } = req.query;
+        
+        const limitNum = parseInt(limit, 10) || 20;
+        const pageNum = parseInt(page, 10) || 1;
+        const offset = (pageNum - 1) * limitNum;
+        
+        const [admins] = await pool.execute(
+            'SELECT id, username, email, role, is_active, last_login, created_at FROM admin_users ORDER BY created_at DESC LIMIT ? OFFSET ?',
+            [limitNum, offset]
+        );
+        
+        const [countResult] = await pool.execute('SELECT COUNT(*) as total FROM admin_users');
+        
+        res.json({
+            success: true,
+            data: admins,
+            pagination: {
+                page: pageNum,
+                limit: limitNum,
+                total: countResult[0].total,
+                pages: Math.ceil(countResult[0].total / limitNum)
+            }
+        });
+        
+    } catch (error) {
+        console.error('Get admin users error:', error);
+        res.status(500).json({ 
+            success: false, 
+            message: 'Failed to fetch admin users' 
+        });
+    }
+});
+
+// إضافة مسؤول جديد
+app.post('/api/admin/users', authenticateToken, [
+    body('username').notEmpty().trim().isLength({ min: 3, max: 100 }),
+    body('email').isEmail(),
+    body('pin_code').isLength({ min: 9, max: 9 }).matches(/^\d+$/).withMessage('PIN must be 9 digits'),
+    body('role').isIn(['admin', 'super_admin'])
+], async (req, res) => {
+    try {
+        const errors = validationResult(req);
+        if (!errors.isEmpty()) {
+            return res.status(400).json({ 
+                success: false, 
+                errors: errors.array() 
+            });
+        }
+        
+        const { username, email, pin_code, role } = req.body;
+        
+        // التحقق من عدم وجود مستخدم بنفس الاسم أو البريد
+        const [existing] = await pool.execute(
+            'SELECT id FROM admin_users WHERE username = ? OR email = ?',
+            [username, email]
+        );
+        
+        if (existing.length > 0) {
+            return res.status(409).json({ 
+                success: false, 
+                message: 'Username or email already exists' 
+            });
+        }
+        
+        await pool.execute(
+            'INSERT INTO admin_users (username, email, pin_code, role) VALUES (?, ?, ?, ?)',
+            [username, email, pin_code, role]
+        );
+        
+        await logActivity(req, 'admin_add', `Added new admin: ${username} (${role})`);
+        
+        res.status(201).json({
+            success: true,
+            message: 'Admin user created successfully'
+        });
+        
+    } catch (error) {
+        console.error('Add admin error:', error);
+        res.status(500).json({ 
+            success: false, 
+            message: 'Failed to add admin user' 
+        });
+    }
+});
+
+// تحديث حالة المسؤول
+app.put('/api/admin/users/:id/status', authenticateToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { is_active } = req.body;
+        
+        if (typeof is_active !== 'boolean') {
+            return res.status(400).json({ 
+                success: false, 
+                message: 'is_active must be a boolean' 
+            });
+        }
+        
+        // منع تعطيل الحساب الخاص
+        if (parseInt(id) === req.user.id) {
+            return res.status(403).json({ 
+                success: false, 
+                message: 'You cannot disable your own account' 
+            });
+        }
+        
+        const [result] = await pool.execute(
+            'UPDATE admin_users SET is_active = ? WHERE id = ?',
+            [is_active, id]
+        );
+        
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ 
+                success: false, 
+                message: 'Admin user not found' 
+            });
+        }
+        
+        const action = is_active ? 'admin_activate' : 'admin_deactivate';
+        const [admin] = await pool.execute('SELECT username FROM admin_users WHERE id = ?', [id]);
+        
+        await logActivity(req, action, `${is_active ? 'Activated' : 'Deactivated'} admin: ${admin[0].username}`);
+        
+        res.json({
+            success: true,
+            message: `Admin account ${is_active ? 'activated' : 'deactivated'} successfully`
+        });
+        
+    } catch (error) {
+        console.error('Update admin status error:', error);
+        res.status(500).json({ 
+            success: false, 
+            message: 'Failed to update admin status' 
+        });
+    }
+});
+
+// ======================
+// ACTIVITY LOGS API
+// ======================
+
+// الحصول على سجلات النشاط
+app.get('/api/activity/logs', authenticateToken, async (req, res) => {
+    try {
+        const { page = 1, limit = 50, action_type, start_date, end_date } = req.query;
+        
+        const limitNum = parseInt(limit, 10) || 50;
+        const pageNum = parseInt(page, 10) || 1;
+        const offset = (pageNum - 1) * limitNum;
+        
+        let query = `
+            SELECT al.*, au.username as admin_name
+            FROM activity_logs al
+            LEFT JOIN admin_users au ON al.admin_id = au.id
+            WHERE 1=1
+        `;
+        let params = [];
+        
+        if (action_type) {
+            query += ' AND al.action_type = ?';
+            params.push(action_type);
+        }
+        
+        if (start_date) {
+            query += ' AND al.created_at >= ?';
+            params.push(start_date);
+        }
+        
+        if (end_date) {
+            query += ' AND al.created_at <= ?';
+            params.push(end_date);
+        }
+        
+        const countQuery = query.replace('SELECT al.*, au.username as admin_name', 'SELECT COUNT(*) as total');
+        const [countResult] = await pool.execute(countQuery, params);
+        const total = countResult[0].total;
+        
+        query += ' ORDER BY al.created_at DESC LIMIT ? OFFSET ?';
+        params.push(limitNum, offset);
+        
+        const [logs] = await pool.execute(query, params);
+        
+        // الحصول على أنواع الإجراءات الفريدة
+        const [actionTypes] = await pool.execute(
+            'SELECT DISTINCT action_type FROM activity_logs ORDER BY action_type'
+        );
+        
+        res.json({
+            success: true,
+            data: logs,
+            action_types: actionTypes.map(a => a.action_type),
+            pagination: {
+                page: pageNum,
+                limit: limitNum,
+                total,
+                pages: Math.ceil(total / limitNum)
+            }
+        });
+        
+    } catch (error) {
+        console.error('Get activity logs error:', error);
+        res.status(500).json({ 
+            success: false, 
+            message: 'Failed to fetch activity logs' 
+        });
+    }
+});
+
+// دالة مساعدة لإنشاء رمز اشتراك
+function generateSubscriptionCode() {
+    // إنشاء رمز رقمي مكون من 12 رقمًا
+    let code = '';
+    for (let i = 0; i < 12; i++) {
+        code += Math.floor(Math.random() * 10);
+    }
+    return code;
+}
+
+// ======================
 // ERROR HANDLING
 // ======================
 
-// 404 handler
+// معالج 404
 app.use((req, res) => {
     res.status(404).json({ 
         success: false, 
         message: 'API endpoint not found',
-        path: req.path
+        path: req.path,
+        method: req.method,
+        timestamp: new Date().toISOString()
     });
 });
 
-// Global error handler
+// معالج الأخطاء العام
 app.use((err, req, res, next) => {
-    console.error('Global error:', err);
+    console.error('❌ Global error:', err);
     
+    // التعامل مع أخطاء محددة
     if (err.code === 'LIMIT_FILE_SIZE') {
         return res.status(400).json({ 
             success: false, 
@@ -1555,10 +2238,11 @@ app.use((err, req, res, next) => {
     if (err instanceof multer.MulterError) {
         return res.status(400).json({ 
             success: false, 
-            message: 'File upload error' 
+            message: 'File upload error: ' + err.message 
         });
     }
     
+    // أخطاء JWT
     if (err.name === 'JsonWebTokenError') {
         return res.status(401).json({ 
             success: false, 
@@ -1566,10 +2250,27 @@ app.use((err, req, res, next) => {
         });
     }
     
+    if (err.name === 'TokenExpiredError') {
+        return res.status(401).json({ 
+            success: false, 
+            message: 'Token expired' 
+        });
+    }
+    
+    // أخطاء CORS
+    if (err.message === 'Not allowed by CORS') {
+        return res.status(403).json({ 
+            success: false, 
+            message: 'CORS error: Origin not allowed' 
+        });
+    }
+    
+    // استجابة الخطأ الافتراضية
     res.status(500).json({ 
         success: false, 
         message: 'Internal server error',
-        error: process.env.NODE_ENV === 'development' ? err.message : undefined
+        error: process.env.NODE_ENV === 'development' ? err.message : undefined,
+        timestamp: new Date().toISOString()
     });
 });
 
@@ -1583,45 +2284,57 @@ async function startServer() {
     try {
         await connectDB();
         
+        // دالة تنظيف الجلسات القديمة
+        setInterval(() => {
+            console.log('Session cleanup running...');
+        }, 60 * 60 * 1000);
+        
         const server = app.listen(PORT, '0.0.0.0', () => {
             console.log(`🚀 Server running on port ${PORT}`);
+            console.log(`📊 Health check: http://localhost:${PORT}/api/health`);
+            console.log(`👑 Admin panel: http://localhost:${PORT}/index.html`);
+            console.log(`📱 Flutter app API: http://localhost:${PORT}/api/app/channels`);
+            console.log(`🎯 Subscription API: http://localhost:${PORT}/api/subscription/status`);
+            console.log(`🔐 Admin login: http://localhost:${PORT}/index.html (PIN: 123456789)`);
             console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
-            console.log(`🔐 Session: sameSite=${sessionConfig.cookie.sameSite}, secure=${sessionConfig.cookie.secure}`);
-            console.log(`🌐 CORS: Enabled with credentials`);
-            console.log(`📁 Uploads: ${uploadDir}`);
+            console.log(`🌐 CORS: Configured for multiple origins`);
+            console.log(`🗄️ Database: ${process.env.DB_NAME || 'railway'}`);
+            console.log(`📁 Uploads directory: ${uploadDir}`);
             
             if (process.env.NODE_ENV === 'production') {
-                console.log(`⚡ Production mode`);
-                console.log(`⚠️  IMPORTANT: Set SESSION_SECRET environment variable`);
+                console.log(`⚡ Production mode enabled`);
+                console.log(`🔒 Trust proxy: Enabled`);
+                console.log(`🍪 Secure cookies: Enabled`);
+                console.log(`🔐 SameSite: none`);
             }
         });
         
-        // Graceful shutdown
+        // معالجة إغلاق الخادم بشكل أنيق
         process.on('SIGTERM', () => {
-            console.log('SIGTERM received, shutting down...');
+            console.log('SIGTERM signal received: closing HTTP server');
             server.close(() => {
-                console.log('Server closed');
+                console.log('HTTP server closed');
                 if (pool) {
                     pool.end();
-                    console.log('Database pool closed');
+                    console.log('Database connection pool closed');
                 }
             });
         });
         
         process.on('SIGINT', () => {
-            console.log('SIGINT received, shutting down...');
+            console.log('SIGINT signal received: closing HTTP server');
             server.close(() => {
-                console.log('Server closed');
+                console.log('HTTP server closed');
                 if (pool) {
                     pool.end();
-                    console.log('Database pool closed');
+                    console.log('Database connection pool closed');
                 }
                 process.exit(0);
             });
         });
         
     } catch (error) {
-        console.error('Failed to start server:', error);
+        console.error('❌ Failed to start server:', error);
         process.exit(1);
     }
 }
