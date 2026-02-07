@@ -265,7 +265,11 @@ const logActivity = async (req, action, description) => {
 // ======================
 // API ROUTES
 // ======================
-
+app.use(cors({
+    origin: '*', 
+    methods: ['GET', 'POST', 'PUT', 'DELETE'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
 // Test route
 app.get('/api/health', (req, res) => {
     res.json({ 
