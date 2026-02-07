@@ -32,43 +32,17 @@ app.use(helmet({
     contentSecurityPolicy: false  // Disable CSP for development
 }));
 
-// CORS configuration - Updated for Flutter app support
-const corsOptions = {
-    origin: function (origin, callback) {
-        // Allow all origins in development
-        if (process.env.NODE_ENV === 'development' || !origin) {
-            callback(null, true);
-        } else {
-            const allowedOrigins = [
-                'http://localhost:3000',
-                'http://localhost:5000',
-                'http://localhost:8080',
-                'http://localhost:8081',
-                'http://localhost',  // For any localhost port
-                'http://10.0.2.2:5000',  // For Android emulator
-                'http://127.0.0.1:5000',  // For local testing
-                'http://10.0.2.2',  // Android emulator
-                'capacitor://localhost',  // Capacitor
-                'ionic://localhost'  // Ionic
-            ];
-            
-            if (allowedOrigins.indexOf(origin) !== -1 || origin.includes('localhost')) {
-                callback(null, true);
-            } else {
-                console.log('Blocked by CORS:', origin);
-                callback(new Error('Not allowed by CORS'));
-            }
-        }
-    },
-    credentials: true,
-    optionsSuccessStatus: 200,
+// CORS configuration - Updated for immediate use
+app.use(cors({
+    origin: '*', // Allows any origin (including Netlify) to connect
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization']
-};
-app.use(cors(corsOptions));
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    credentials: true,
+    optionsSuccessStatus: 200
+}));
 
 // Handle preflight requests
-app.options('*', cors(corsOptions));
+app.options('*', cors());
 
 // Rate limiting - more permissive for app endpoints
 const apiLimiter = rateLimit({
@@ -265,11 +239,7 @@ const logActivity = async (req, action, description) => {
 // ======================
 // API ROUTES
 // ======================
-app.use(cors({
-    origin: '*', 
-    methods: ['GET', 'POST', 'PUT', 'DELETE'],
-    allowedHeaders: ['Content-Type', 'Authorization']
-}));
+
 // Test route
 app.get('/api/health', (req, res) => {
     res.json({ 
@@ -1600,7 +1570,7 @@ app.use((err, req, res, next) => {
 // SERVER STARTUP
 // ======================
 
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 8080;
 
 async function startServer() {
     try {
@@ -1614,6 +1584,7 @@ async function startServer() {
             console.log(`🎯 Subscription API: http://localhost:${PORT}/api/subscription/status`);
             console.log(`🔐 Admin login: http://localhost:${PORT}/index.html (PIN: 123456789)`);
             console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
+            console.log(`🌐 CORS: Enabled for all origins (origin: *)`);
         });
         
     } catch (error) {
