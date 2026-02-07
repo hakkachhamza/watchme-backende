@@ -439,6 +439,17 @@ const logActivity = async (req, action, description) => {
 };
 
 // ======================
+// HELPER FUNCTIONS
+// ======================
+
+// دالة مساعدة لتحويل القيم الرقمية
+function parseNumber(value, defaultValue = 0) {
+    if (value === undefined || value === null) return defaultValue;
+    const num = parseInt(value);
+    return isNaN(num) ? defaultValue : num;
+}
+
+// ======================
 // API ROUTES
 // ======================
 
@@ -538,7 +549,11 @@ app.post('/api/admin/login', [
 app.get('/api/channels', authenticateToken, async (req, res) => {
     try {
         const { category, search, page = 1, limit = 50 } = req.query;
-        const offset = (page - 1) * limit;
+        
+        // تحويل القيم إلى أرقام
+        const pageNum = parseNumber(page, 1);
+        const limitNum = parseNumber(limit, 50);
+        const offset = (pageNum - 1) * limitNum;
         
         let query = 'SELECT * FROM channels WHERE 1=1';
         let params = [];
@@ -559,7 +574,7 @@ app.get('/api/channels', authenticateToken, async (req, res) => {
         const total = countResult[0].total;
         
         query += ' ORDER BY created_at DESC, name LIMIT ? OFFSET ?';
-        params.push(parseInt(limit), parseInt(offset));
+        params.push(limitNum, offset);
         
         const [channels] = await pool.execute(query, params);
         
@@ -571,10 +586,10 @@ app.get('/api/channels', authenticateToken, async (req, res) => {
             success: true,
             data: channels,
             pagination: {
-                page: parseInt(page),
-                limit: parseInt(limit),
+                page: pageNum,
+                limit: limitNum,
                 total,
-                pages: Math.ceil(total / limit)
+                pages: Math.ceil(total / limitNum)
             },
             categories: categories.map(c => c.category),
             totalChannels: total
@@ -1193,7 +1208,11 @@ app.post('/api/codes/generate', authenticateToken, [
 app.get('/api/codes', authenticateToken, async (req, res) => {
     try {
         const { status, search, page = 1, limit = 50 } = req.query;
-        const offset = (page - 1) * limit;
+        
+        // تحويل القيم إلى أرقام
+        const pageNum = parseNumber(page, 1);
+        const limitNum = parseNumber(limit, 50);
+        const offset = (pageNum - 1) * limitNum;
         
         let query = `
             SELECT sc.* 
@@ -1221,7 +1240,7 @@ app.get('/api/codes', authenticateToken, async (req, res) => {
         const total = countResult[0].total;
         
         query += ' ORDER BY sc.created_at DESC LIMIT ? OFFSET ?';
-        params.push(parseInt(limit), parseInt(offset));
+        params.push(limitNum, offset);
         
         const [codes] = await pool.execute(query, params);
         
@@ -1239,10 +1258,10 @@ app.get('/api/codes', authenticateToken, async (req, res) => {
             success: true,
             data: codes,
             pagination: {
-                page: parseInt(page),
-                limit: parseInt(limit),
+                page: pageNum,
+                limit: limitNum,
                 total,
-                pages: Math.ceil(total / limit)
+                pages: Math.ceil(total / limitNum)
             },
             statistics: stats[0]
         });
