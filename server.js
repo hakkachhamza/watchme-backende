@@ -439,17 +439,6 @@ const logActivity = async (req, action, description) => {
 };
 
 // ======================
-// HELPER FUNCTIONS
-// ======================
-
-// دالة مساعدة لتحويل القيم الرقمية
-function parseNumber(value, defaultValue = 0) {
-    if (value === undefined || value === null) return defaultValue;
-    const num = parseInt(value);
-    return isNaN(num) ? defaultValue : num;
-}
-
-// ======================
 // API ROUTES
 // ======================
 
@@ -550,9 +539,9 @@ app.get('/api/channels', authenticateToken, async (req, res) => {
     try {
         const { category, search, page = 1, limit = 50 } = req.query;
         
-        // تحويل القيم إلى أرقام
-        const pageNum = parseNumber(page, 1);
-        const limitNum = parseNumber(limit, 50);
+        // إصلاح: تحويل القيم القادمة من الرابط (Query Params) إلى أرقام صحيحة
+        const limitNum = parseInt(limit, 10) || 50;
+        const pageNum = parseInt(page, 10) || 1;
         const offset = (pageNum - 1) * limitNum;
         
         let query = 'SELECT * FROM channels WHERE 1=1';
@@ -576,7 +565,8 @@ app.get('/api/channels', authenticateToken, async (req, res) => {
         query += ' ORDER BY created_at DESC, name LIMIT ? OFFSET ?';
         params.push(limitNum, offset);
         
-        const [channels] = await pool.execute(query, params);
+        // إصلاح: استخدام query بدلاً من execute إذا استمرت المشكلة
+        const [channels] = await pool.query(query, params);
         
         const [categories] = await pool.execute(
             'SELECT DISTINCT category FROM channels WHERE category IS NOT NULL AND category != "" ORDER BY category'
@@ -1209,9 +1199,9 @@ app.get('/api/codes', authenticateToken, async (req, res) => {
     try {
         const { status, search, page = 1, limit = 50 } = req.query;
         
-        // تحويل القيم إلى أرقام
-        const pageNum = parseNumber(page, 1);
-        const limitNum = parseNumber(limit, 50);
+        // إصلاح: تحويل القيم القادمة من الرابط (Query Params) إلى أرقام صحيحة
+        const limitNum = parseInt(limit, 10) || 50;
+        const pageNum = parseInt(page, 10) || 1;
         const offset = (pageNum - 1) * limitNum;
         
         let query = `
@@ -1242,7 +1232,8 @@ app.get('/api/codes', authenticateToken, async (req, res) => {
         query += ' ORDER BY sc.created_at DESC LIMIT ? OFFSET ?';
         params.push(limitNum, offset);
         
-        const [codes] = await pool.execute(query, params);
+        // إصلاح: استخدام query بدلاً من execute لضمان معالجة الأرقام بشكل صحيح
+        const [codes] = await pool.query(query, params);
         
         // الحصول على الإحصائيات
         const [stats] = await pool.execute(`
