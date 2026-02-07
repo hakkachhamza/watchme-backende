@@ -16,45 +16,84 @@ require('dotenv').config();
 // Initialize Express app
 const app = express();
 
-// Session middleware
+// حل مشكلة الـ Proxy في Railway
+app.set('trust proxy', 1);
+
+// Session middleware - معدل للعمل مع Railway
 app.use(session({
-    secret: process.env.SESSION_SECRET || 'watchme-secret-key-2024',
+    secret: process.env.SESSION_SECRET || 'watchme-secret-key-2024-change-in-production',
     resave: false,
     saveUninitialized: false,
+    proxy: process.env.NODE_ENV === 'production', // مهم للـ proxy
     cookie: { 
         secure: process.env.NODE_ENV === 'production',
+        sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
         maxAge: 24 * 60 * 60 * 1000 // 24 hours
     }
 }));
 
 // Security middleware
 app.use(helmet({
-    contentSecurityPolicy: false  // Disable CSP for development
+    contentSecurityPolicy: false,  // Disable CSP for development
+    crossOriginResourcePolicy: { policy: "cross-origin" } // مهم للصور والموارد
 }));
 
-// CORS configuration - Updated for immediate use
-app.use(cors({
-    origin: '*', // Allows any origin (including Netlify) to connect
+// CORS configuration - معدل للأمان
+const corsOptions = {
+    origin: function (origin, callback) {
+        // السماح بطلبات بدون أصل (مثل mobile apps, curl)
+        if (!origin) return callback(null, true);
+        
+        const allowedOrigins = [
+            'http://localhost:3000',
+            'http://localhost:8080',
+            'http://localhost:8081',
+            'https://watchme-admin.netlify.app',
+            // أضف أصول Netlify الخاصة بك هنا
+            process.env.CORS_ORIGIN
+        ].filter(Boolean);
+        
+        if (allowedOrigins.indexOf(origin) !== -1 || process.env.NODE_ENV === 'development') {
+            callback(null, true);
+        } else {
+            console.log('CORS Blocked Origin:', origin);
+            callback(new Error('Not allowed by CORS'));
+        }
+    },
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
     credentials: true,
-    optionsSuccessStatus: 200
-}));
+    optionsSuccessStatus: 200,
+    maxAge: 86400 // 24 ساعة
+};
+
+app.use(cors(corsOptions));
 
 // Handle preflight requests
-app.options('*', cors());
+app.options('*', cors(corsOptions));
 
-// Rate limiting - more permissive for app endpoints
+// Rate limiting - أكثر تساهلاً للنشر الأولي
 const apiLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: process.env.NODE_ENV === 'production' ? 100 : 1000,
-    message: 'Too many requests from this IP, please try again later.'
+    windowMs: 15 * 60 * 1000, // 15 دقيقة
+    max: process.env.NODE_ENV === 'production' ? 200 : 5000,
+    message: 'Too many requests from this IP, please try again later.',
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req) => {
+        // استخدام IP حقيقي مع الـ proxy
+        return req.headers['x-forwarded-for'] || req.ip;
+    }
 });
 
 const appLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: process.env.NODE_ENV === 'production' ? 500 : 5000,
-    message: 'Too many requests from this IP, please try again later.'
+    max: process.env.NODE_ENV === 'production' ? 1000 : 10000,
+    message: 'Too many requests from this IP, please try again later.',
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req) => {
+        return req.headers['x-forwarded-for'] || req.ip;
+    }
 });
 
 app.use('/api/', apiLimiter);
@@ -62,11 +101,27 @@ app.use('/api/app/', appLimiter);
 app.use('/api/subscription/', appLimiter);
 
 // Body parsing middleware
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use(express.json({ 
+    limit: '10mb',
+    verify: (req, res, buf) => {
+        req.rawBody = buf.toString();
+    }
+}));
+app.use(express.urlencoded({ 
+    extended: true, 
+    limit: '10mb',
+    parameterLimit: 10000
+}));
 
 // Static files
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(path.join(__dirname, 'public'), {
+    maxAge: '1d',
+    setHeaders: (res, path) => {
+        if (path.endsWith('.html')) {
+            res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+        }
+    }
+}));
 
 // File upload configuration
 const upload = multer({
@@ -87,7 +142,7 @@ const upload = multer({
         fileSize: 10 * 1024 * 1024 // 10MB
     },
     fileFilter: function (req, file, cb) {
-        const allowedMimeTypes = ['text/plain', 'application/octet-stream'];
+        const allowedMimeTypes = ['text/plain', 'application/octet-stream', 'application/x-mpegURL'];
         const allowedExtensions = ['.m3u', '.m3u8'];
         
         const extname = path.extname(file.originalname).toLowerCase();
@@ -104,63 +159,210 @@ const upload = multer({
 let pool;
 async function connectDB() {
     try {
-        pool = mysql.createPool({
+        // استخدام متغيرات البيئة أو القيم الافتراضية
+        const dbConfig = {
             host: process.env.DB_HOST || 'mysql.railway.internal',
             user: process.env.DB_USER || 'root',
-            password: process.env.DB_PASSWORD || 'jRVrVskgegUurgOGJmWUHvkVugrSwHJJ',
+            password: process.env.DB_PASSWORD || 'zJlfstHREMzYlkwajJvhrLbeyekdwJtD',
             database: process.env.DB_NAME || 'railway',
             port: process.env.DB_PORT || 3306,
             waitForConnections: true,
-            connectionLimit: 10,
+            connectionLimit: 20, // زيادة للتعامل مع طلبات متعددة
             queueLimit: 0,
             enableKeepAlive: true,
-            keepAliveInitialDelay: 0
+            keepAliveInitialDelay: 10000,
+            connectTimeout: 60000,
+            ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : false
+        };
+        
+        console.log('Attempting to connect to database with config:', {
+            host: dbConfig.host,
+            user: dbConfig.user,
+            database: dbConfig.database,
+            port: dbConfig.port
         });
         
-        // Test connection
+        pool = mysql.createPool(dbConfig);
+        
+        // اختبار الاتصال
         const connection = await pool.getConnection();
         console.log('✅ Database connected successfully');
+        
+        // اختبار استعلام بسيط
+        const [rows] = await connection.execute('SELECT 1 + 1 AS result');
+        console.log('Database test query result:', rows[0].result);
+        
         connection.release();
         
-        // Initialize database tables if needed
+        // تهيئة جداول قاعدة البيانات
         await initializeDatabase();
         
     } catch (error) {
         console.error('❌ Database connection failed:', error.message);
+        console.error('Error stack:', error.stack);
         console.error('Please ensure:');
         console.error('1. MySQL server is running');
-        console.error('2. Database "watchme_db" exists');
+        console.error('2. Database exists');
         console.error('3. User has proper permissions');
         console.error('4. Check your .env file configuration');
-        process.exit(1);
+        console.error('Current DB config:', {
+            host: process.env.DB_HOST,
+            user: process.env.DB_USER,
+            database: process.env.DB_NAME,
+            port: process.env.DB_PORT
+        });
+        
+        // إعادة المحاولة بعد 5 ثواني
+        console.log('Retrying connection in 5 seconds...');
+        setTimeout(connectDB, 5000);
     }
 }
 
-// Initialize database tables
+// تهيئة جداول قاعدة البيانات
 async function initializeDatabase() {
     try {
-        // Check if tables exist
-        const [tables] = await pool.execute(`
-            SELECT TABLE_NAME 
-            FROM information_schema.TABLES 
-            WHERE TABLE_SCHEMA = ?
-        `, [process.env.DB_NAME || 'watchme_db']);
+        // إنشاء الجداول إذا لم تكن موجودة
+        const createTables = `
+            -- جدول المستخدمين الإداريين
+            CREATE TABLE IF NOT EXISTS admin_users (
+                id INT PRIMARY KEY AUTO_INCREMENT,
+                username VARCHAR(100) UNIQUE NOT NULL,
+                email VARCHAR(255) UNIQUE NOT NULL,
+                pin_code VARCHAR(20) NOT NULL,
+                role ENUM('admin', 'super_admin') DEFAULT 'admin',
+                is_active BOOLEAN DEFAULT TRUE,
+                last_login DATETIME,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            );
+            
+            -- جدول القنوات
+            CREATE TABLE IF NOT EXISTS channels (
+                id VARCHAR(255) PRIMARY KEY,
+                name VARCHAR(255) NOT NULL,
+                url TEXT NOT NULL,
+                category VARCHAR(100),
+                logo_url TEXT,
+                is_active BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                INDEX idx_category (category),
+                INDEX idx_name (name)
+            );
+            
+            -- جدول رموز الاشتراك
+            CREATE TABLE IF NOT EXISTS subscription_codes (
+                id VARCHAR(255) PRIMARY KEY,
+                code VARCHAR(50) UNIQUE NOT NULL,
+                duration_days INT NOT NULL,
+                code_type ENUM('premium', 'trial', 'promo') DEFAULT 'premium',
+                expiry_date DATETIME NOT NULL,
+                is_used BOOLEAN DEFAULT FALSE,
+                used_by VARCHAR(255),
+                used_at DATETIME,
+                generated_by VARCHAR(100),
+                notes TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_code (code),
+                INDEX idx_is_used (is_used),
+                INDEX idx_expiry (expiry_date)
+            );
+            
+            -- جدول اشتراكات المستخدمين
+            CREATE TABLE IF NOT EXISTS user_subscriptions (
+                id VARCHAR(255) PRIMARY KEY,
+                user_id VARCHAR(255) NOT NULL,
+                subscription_code VARCHAR(50) NOT NULL,
+                device_id VARCHAR(255),
+                activated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at DATETIME NOT NULL,
+                is_active BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                INDEX idx_user_id (user_id),
+                INDEX idx_expires_at (expires_at),
+                INDEX idx_is_active (is_active)
+            );
+            
+            -- جدول سجل النشاط
+            CREATE TABLE IF NOT EXISTS activity_logs (
+                id INT PRIMARY KEY AUTO_INCREMENT,
+                admin_id INT,
+                action_type VARCHAR(100) NOT NULL,
+                description TEXT,
+                ip_address VARCHAR(45),
+                user_agent TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_admin_id (admin_id),
+                INDEX idx_created_at (created_at),
+                FOREIGN KEY (admin_id) REFERENCES admin_users(id) ON DELETE SET NULL
+            );
+            
+            -- جدول إعدادات القائمة
+            CREATE TABLE IF NOT EXISTS playlist_settings (
+                id INT PRIMARY KEY AUTO_INCREMENT,
+                setting_key VARCHAR(100) UNIQUE NOT NULL,
+                setting_value TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            );
+            
+            -- جدول مستخدمي التطبيق
+            CREATE TABLE IF NOT EXISTS app_users (
+                id INT PRIMARY KEY AUTO_INCREMENT,
+                device_id VARCHAR(255) UNIQUE NOT NULL,
+                subscription_code VARCHAR(50),
+                last_active DATETIME,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                INDEX idx_device_id (device_id)
+            );
+        `;
         
-        const tableNames = tables.map(t => t.TABLE_NAME);
+        // تنفيذ استعلامات إنشاء الجداول
+        const queries = createTables.split(';').filter(q => q.trim());
         
-        // Create tables if they don't exist
-        const requiredTables = ['admin_users', 'channels', 'subscription_codes', 'user_subscriptions', 'activity_logs', 'playlist_settings'];
-        const missingTables = requiredTables.filter(table => !tableNames.includes(table));
-        
-        if (missingTables.length > 0) {
-            console.log('⚠️ Missing tables detected. Please run the database.sql script.');
-            console.log('Missing tables:', missingTables);
-        } else {
-            console.log('✅ All database tables are present');
+        for (const query of queries) {
+            if (query.trim()) {
+                await pool.execute(query + ';');
+            }
         }
+        
+        // إدخال مستخدم إداري افتراضي إذا لم يكن موجودًا
+        const [adminExists] = await pool.execute(
+            'SELECT id FROM admin_users WHERE username = ?',
+            ['admin']
+        );
+        
+        if (adminExists.length === 0) {
+            const defaultPin = '123456789'; // تغيير هذا في البيئة الإنتاجية
+            await pool.execute(
+                'INSERT INTO admin_users (username, email, pin_code, role) VALUES (?, ?, ?, ?)',
+                ['admin', 'admin@watchme.com', defaultPin, 'super_admin']
+            );
+            console.log('✅ Default admin user created with PIN: 123456789');
+        }
+        
+        // إدخال إعدادات افتراضية
+        const defaultSettings = [
+            ['app_name', 'Watch Me Premium'],
+            ['company_name', 'Watch Me Streaming'],
+            ['support_email', 'support@watchme.com'],
+            ['version', '1.0.0']
+        ];
+        
+        for (const [key, value] of defaultSettings) {
+            await pool.execute(
+                'INSERT IGNORE INTO playlist_settings (setting_key, setting_value) VALUES (?, ?)',
+                [key, value]
+            );
+        }
+        
+        console.log('✅ Database tables initialized successfully');
         
     } catch (error) {
         console.error('❌ Database initialization error:', error.message);
+        console.error('Error stack:', error.stack);
     }
 }
 
@@ -177,10 +379,10 @@ const authenticateToken = async (req, res, next) => {
             });
         }
         
-        // Verify JWT
+        // التحقق من JWT
         const decoded = jwt.verify(token, process.env.JWT_SECRET || 'watchme-jwt-secret-2024-change-this-in-production');
         
-        // Check if admin exists and is active
+        // التحقق من وجود المسؤول ونشاطه
         const [admin] = await pool.execute(
             'SELECT id, username, email, role FROM admin_users WHERE id = ? AND is_active = TRUE',
             [decoded.userId]
@@ -216,7 +418,7 @@ const authenticateToken = async (req, res, next) => {
     }
 };
 
-// Log activity middleware
+// تسجيل النشاط middleware
 const logActivity = async (req, action, description) => {
     try {
         await pool.execute(
@@ -227,7 +429,7 @@ const logActivity = async (req, action, description) => {
                 req.user?.id || null,
                 action,
                 description,
-                req.ip || req.connection.remoteAddress,
+                req.headers['x-forwarded-for'] || req.ip || req.connection.remoteAddress,
                 req.headers['user-agent']
             ]
         );
@@ -242,17 +444,21 @@ const logActivity = async (req, action, description) => {
 
 // Test route
 app.get('/api/health', (req, res) => {
-    res.json({ 
+    const healthStatus = {
         success: true, 
         message: 'Watch Me Admin Server is running',
         timestamp: new Date().toISOString(),
         version: '1.0.0',
-        environment: process.env.NODE_ENV || 'development'
-    });
+        environment: process.env.NODE_ENV || 'development',
+        database: pool ? 'connected' : 'disconnected',
+        uptime: process.uptime(),
+        memory: process.memoryUsage(),
+        ip: req.headers['x-forwarded-for'] || req.ip
+    };
+    
+    res.json(healthStatus);
 });
 
-
-// Admin authentication routes
 // Admin authentication with PIN
 app.post('/api/admin/login', [
     body('pin').isLength({ min: 9, max: 9 }).matches(/^\d+$/).withMessage('PIN must be 9 digits')
@@ -268,7 +474,7 @@ app.post('/api/admin/login', [
         
         const { pin } = req.body;
         
-        // Find admin user by PIN
+        // البحث عن المسؤول باستخدام PIN
         const [admins] = await pool.execute(
             'SELECT * FROM admin_users WHERE pin_code = ? AND is_active = TRUE',
             [pin]
@@ -283,13 +489,13 @@ app.post('/api/admin/login', [
         
         const admin = admins[0];
         
-        // Update last login
+        // تحديث آخر تسجيل دخول
         await pool.execute(
             'UPDATE admin_users SET last_login = NOW() WHERE id = ?',
             [admin.id]
         );
         
-        // Generate JWT token
+        // إنشاء JWT token
         const token = jwt.sign(
             { 
                 userId: admin.id, 
@@ -300,8 +506,8 @@ app.post('/api/admin/login', [
             { expiresIn: process.env.JWT_EXPIRES_IN || '24h' }
         );
         
-        // Log activity
-        await logActivity({ user: { id: admin.id }, ip: req.ip }, 'login', `Admin logged in with PIN: ${admin.username}`);
+        // تسجيل النشاط
+        await logActivity({ user: { id: admin.id }, headers: req.headers, ip: req.ip }, 'login', `Admin logged in: ${admin.username}`);
         
         res.json({
             success: true,
@@ -328,7 +534,7 @@ app.post('/api/admin/login', [
 // CHANNEL MANAGEMENT API
 // ======================
 
-// Get all channels
+// الحصول على جميع القنوات
 app.get('/api/channels', authenticateToken, async (req, res) => {
     try {
         const { category, search, page = 1, limit = 50 } = req.query;
@@ -343,16 +549,16 @@ app.get('/api/channels', authenticateToken, async (req, res) => {
         }
         
         if (search) {
-            query += ' AND (name LIKE ? OR category LIKE ?)';
+            query += ' AND (name LIKE ? OR category LIKE ? OR url LIKE ?)';
             const searchTerm = `%${search}%`;
-            params.push(searchTerm, searchTerm);
+            params.push(searchTerm, searchTerm, searchTerm);
         }
         
         const countQuery = query.replace('SELECT *', 'SELECT COUNT(*) as total');
         const [countResult] = await pool.execute(countQuery, params);
         const total = countResult[0].total;
         
-        query += ' ORDER BY name LIMIT ? OFFSET ?';
+        query += ' ORDER BY created_at DESC, name LIMIT ? OFFSET ?';
         params.push(parseInt(limit), parseInt(offset));
         
         const [channels] = await pool.execute(query, params);
@@ -383,12 +589,12 @@ app.get('/api/channels', authenticateToken, async (req, res) => {
     }
 });
 
-// Add new channel
+// إضافة قناة جديدة
 app.post('/api/channels', authenticateToken, [
     body('name').notEmpty().trim().isLength({ min: 1, max: 200 }),
-    body('url').notEmpty().trim().isURL(),
+    body('url').notEmpty().trim(),
     body('category').optional().trim().isLength({ max: 100 }),
-    body('logo').optional().trim().isURL()
+    body('logo').optional().trim()
 ], async (req, res) => {
     try {
         const errors = validationResult(req);
@@ -401,16 +607,16 @@ app.post('/api/channels', authenticateToken, [
         
         const { name, url, category = 'General', logo } = req.body;
         
-        // Check if channel already exists
+        // التحقق من وجود القناة مسبقًا
         const [existing] = await pool.execute(
-            'SELECT id FROM channels WHERE url = ?',
-            [url]
+            'SELECT id FROM channels WHERE url = ? OR name = ?',
+            [url, name]
         );
         
         if (existing.length > 0) {
             return res.status(409).json({ 
                 success: false, 
-                message: 'Channel with this URL already exists' 
+                message: 'Channel with this URL or name already exists' 
             });
         }
         
@@ -445,18 +651,18 @@ app.post('/api/channels', authenticateToken, [
     }
 });
 
-// Update channel
+// تحديث القناة
 app.put('/api/channels/:id', authenticateToken, [
     body('name').optional().trim().isLength({ min: 1, max: 200 }),
-    body('url').optional().trim().isURL(),
+    body('url').optional().trim(),
     body('category').optional().trim().isLength({ max: 100 }),
-    body('logo').optional().trim().isURL()
+    body('logo').optional().trim()
 ], async (req, res) => {
     try {
         const { id } = req.params;
         const updates = req.body;
         
-        // Check if channel exists
+        // التحقق من وجود القناة
         const [existing] = await pool.execute(
             'SELECT name FROM channels WHERE id = ?',
             [id]
@@ -472,7 +678,7 @@ app.put('/api/channels/:id', authenticateToken, [
         const updateFields = [];
         const values = [];
         
-        // Build dynamic update query
+        // بناء استعلام التحديث الديناميكي
         if (updates.name !== undefined) {
             updateFields.push('name = ?');
             values.push(updates.name);
@@ -491,6 +697,11 @@ app.put('/api/channels/:id', authenticateToken, [
         if (updates.logo !== undefined) {
             updateFields.push('logo_url = ?');
             values.push(updates.logo);
+        }
+        
+        if (updates.is_active !== undefined) {
+            updateFields.push('is_active = ?');
+            values.push(updates.is_active);
         }
         
         if (updateFields.length === 0) {
@@ -529,12 +740,12 @@ app.put('/api/channels/:id', authenticateToken, [
     }
 });
 
-// Delete channel
+// حذف القناة
 app.delete('/api/channels/:id', authenticateToken, async (req, res) => {
     try {
         const { id } = req.params;
         
-        // Get channel info before deleting
+        // الحصول على معلومات القناة قبل الحذف
         const [channels] = await pool.execute(
             'SELECT name FROM channels WHERE id = ?',
             [id]
@@ -570,39 +781,54 @@ app.delete('/api/channels/:id', authenticateToken, async (req, res) => {
     }
 });
 
-// Bulk delete channels
+// حذف جماعي للقنوات
 app.post('/api/channels/bulk-delete', authenticateToken, async (req, res) => {
+    const connection = await pool.getConnection();
+    
     try {
         const { channelIds } = req.body;
         
         if (!Array.isArray(channelIds) || channelIds.length === 0) {
+            await connection.release();
             return res.status(400).json({ 
                 success: false, 
                 message: 'No channels selected' 
             });
         }
         
-        // Get channel names for logging
-        const placeholders = channelIds.map(() => '?').join(',');
-        const [channels] = await pool.execute(
-            `SELECT name FROM channels WHERE id IN (${placeholders})`,
-            channelIds
-        );
+        await connection.beginTransaction();
         
-        const channelNames = channels.map(c => c.name).join(', ');
-        
-        // Delete channels
-        const [result] = await pool.execute(
-            `DELETE FROM channels WHERE id IN (${placeholders})`,
-            channelIds
-        );
-        
-        await logActivity(req, 'channel_bulk_delete', `Deleted ${result.affectedRows} channels: ${channelNames}`);
-        
-        res.json({
-            success: true,
-            message: `${result.affectedRows} channels deleted successfully`
-        });
+        try {
+            // الحصول على أسماء القنوات للتسجيل
+            const placeholders = channelIds.map(() => '?').join(',');
+            const [channels] = await connection.execute(
+                `SELECT name FROM channels WHERE id IN (${placeholders})`,
+                channelIds
+            );
+            
+            const channelNames = channels.map(c => c.name).join(', ');
+            
+            // حذف القنوات
+            const [result] = await connection.execute(
+                `DELETE FROM channels WHERE id IN (${placeholders})`,
+                channelIds
+            );
+            
+            await connection.commit();
+            await connection.release();
+            
+            await logActivity(req, 'channel_bulk_delete', `Deleted ${result.affectedRows} channels: ${channelNames.substring(0, 200)}`);
+            
+            res.json({
+                success: true,
+                message: `${result.affectedRows} channels deleted successfully`
+            });
+            
+        } catch (error) {
+            await connection.rollback();
+            await connection.release();
+            throw error;
+        }
         
     } catch (error) {
         console.error('Bulk delete error:', error);
@@ -617,7 +843,7 @@ app.post('/api/channels/bulk-delete', authenticateToken, async (req, res) => {
 // M3U IMPORT API
 // ======================
 
-// Upload M3U file
+// رفع ملف M3U
 app.post('/api/upload/m3u', authenticateToken, upload.single('m3uFile'), async (req, res) => {
     try {
         if (!req.file) {
@@ -630,12 +856,16 @@ app.post('/api/upload/m3u', authenticateToken, upload.single('m3uFile'), async (
         const filePath = req.file.path;
         const action = req.body.action || 'append';
         
-        // Read and parse file
+        // قراءة وتحليل الملف
         const fileContent = fs.readFileSync(filePath, 'utf8');
         const parsedChannels = parseM3UContent(fileContent);
         
-        // Clean up uploaded file
-        fs.unlinkSync(filePath);
+        // تنظيف الملف المرفوع
+        try {
+            fs.unlinkSync(filePath);
+        } catch (unlinkError) {
+            console.warn('Could not delete uploaded file:', unlinkError.message);
+        }
         
         if (parsedChannels.length === 0) {
             return res.status(400).json({ 
@@ -644,7 +874,7 @@ app.post('/api/upload/m3u', authenticateToken, upload.single('m3uFile'), async (
             });
         }
         
-        // Store in session
+        // تخزين في الجلسة
         const importId = Date.now().toString();
         req.session.importData = { 
             importId, 
@@ -659,15 +889,20 @@ app.post('/api/upload/m3u', authenticateToken, upload.single('m3uFile'), async (
             message: 'M3U file parsed successfully',
             importId,
             data: parsedChannels.slice(0, 50),
-            total: parsedChannels.length
+            total: parsedChannels.length,
+            sampleCount: Math.min(50, parsedChannels.length)
         });
         
     } catch (error) {
         console.error('M3U upload error:', error);
         
-        // Clean up file if exists
+        // تنظيف الملف إذا كان موجودًا
         if (req.file && fs.existsSync(req.file.path)) {
-            fs.unlinkSync(req.file.path);
+            try {
+                fs.unlinkSync(req.file.path);
+            } catch (unlinkError) {
+                console.warn('Could not delete file after error:', unlinkError.message);
+            }
         }
         
         res.status(500).json({ 
@@ -677,7 +912,7 @@ app.post('/api/upload/m3u', authenticateToken, upload.single('m3uFile'), async (
     }
 });
 
-// Confirm M3U import
+// تأكيد استيراد M3U
 app.post('/api/import/m3u', authenticateToken, async (req, res) => {
     const connection = await pool.getConnection();
     
@@ -685,6 +920,7 @@ app.post('/api/import/m3u', authenticateToken, async (req, res) => {
         const { importId, action = 'append' } = req.body;
         
         if (!req.session.importData || req.session.importData.importId !== importId) {
+            await connection.release();
             return res.status(400).json({ 
                 success: false, 
                 message: 'Import session expired or invalid' 
@@ -693,25 +929,40 @@ app.post('/api/import/m3u', authenticateToken, async (req, res) => {
         
         const { channels: parsedChannels } = req.session.importData;
         
+        if (!parsedChannels || parsedChannels.length === 0) {
+            await connection.release();
+            return res.status(400).json({ 
+                success: false, 
+                message: 'No channels to import' 
+            });
+        }
+        
         await connection.beginTransaction();
         
         try {
             if (action === 'replace') {
                 await connection.execute('DELETE FROM channels');
+                console.log('Cleared existing channels for replacement');
             }
             
             let importedCount = 0;
             let skippedCount = 0;
+            let errorCount = 0;
             
             for (const channel of parsedChannels) {
                 try {
-                    // Check if channel already exists (by URL)
+                    // التحقق مما إذا كانت القناة موجودة مسبقًا (عن طريق URL)
                     const [existing] = await connection.execute(
                         'SELECT id FROM channels WHERE url = ?',
                         [channel.url]
                     );
                     
                     if (existing.length === 0 || action === 'replace') {
+                        // إذا كانت موجودة في وضع الاستبدال، احذفها أولاً
+                        if (existing.length > 0 && action === 'replace') {
+                            await connection.execute('DELETE FROM channels WHERE id = ?', [existing[0].id]);
+                        }
+                        
                         await connection.execute(
                             `INSERT INTO channels 
                             (id, name, url, category, logo_url) 
@@ -730,29 +981,33 @@ app.post('/api/import/m3u', authenticateToken, async (req, res) => {
                     }
                 } catch (err) {
                     console.error('Error importing channel:', err.message);
-                    skippedCount++;
+                    errorCount++;
                 }
             }
             
             await connection.commit();
             
-            // Clear session data
+            // مسح بيانات الجلسة
             delete req.session.importData;
             
-            await logActivity(req, 'm3u_import', `Imported ${importedCount} channels from M3U (${action}), skipped ${skippedCount}`);
+            await logActivity(req, 'm3u_import', `Imported ${importedCount} channels from M3U (${action}), skipped ${skippedCount}, errors ${errorCount}`);
             
             const [countResult] = await connection.execute('SELECT COUNT(*) as total FROM channels');
             
+            await connection.release();
+            
             res.json({
                 success: true,
-                message: `Successfully imported ${importedCount} channels (${skippedCount} skipped)`,
+                message: `Successfully imported ${importedCount} channels (${skippedCount} skipped, ${errorCount} errors)`,
                 imported: importedCount,
                 skipped: skippedCount,
+                errors: errorCount,
                 totalChannels: countResult[0].total
             });
             
         } catch (error) {
             await connection.rollback();
+            await connection.release();
             throw error;
         }
         
@@ -762,12 +1017,10 @@ app.post('/api/import/m3u', authenticateToken, async (req, res) => {
             success: false, 
             message: 'Failed to import channels' 
         });
-    } finally {
-        connection.release();
     }
 });
 
-// Parse M3U content helper function
+// دالة مساعدة لتحليل محتوى M3U
 function parseM3UContent(content) {
     const channels = [];
     const lines = content.split('\n');
@@ -784,38 +1037,47 @@ function parseM3UContent(content) {
                 logo: ''
             };
             
-            // Extract name
+            // استخراج الاسم
             const nameStart = trimmedLine.indexOf(',') + 1;
             if (nameStart > 0 && nameStart < trimmedLine.length) {
                 currentChannel.name = trimmedLine.substring(nameStart).trim();
                 
-                // Remove extra attributes from name
+                // إزالة السمات الإضافية من الاسم
                 const attrIndex = currentChannel.name.indexOf(', tvg-');
                 if (attrIndex !== -1) {
                     currentChannel.name = currentChannel.name.substring(0, attrIndex);
                 }
                 
-                // Clean up name
+                // تنظيف الاسم
                 currentChannel.name = currentChannel.name.replace(/["']/g, '').trim();
+                if (currentChannel.name.length > 200) {
+                    currentChannel.name = currentChannel.name.substring(0, 200);
+                }
             }
             
-            // Extract logo
+            // استخراج الشعار
             const logoMatch = trimmedLine.match(/tvg-logo="([^"]+)"/);
             if (logoMatch && logoMatch[1]) {
                 currentChannel.logo = logoMatch[1].trim();
+                if (currentChannel.logo.length > 500) {
+                    currentChannel.logo = currentChannel.logo.substring(0, 500);
+                }
             }
             
-            // Extract group/category
+            // استخراج المجموعة/الفئة
             const groupMatch = trimmedLine.match(/group-title="([^"]+)"/);
             if (groupMatch && groupMatch[1]) {
                 currentChannel.category = groupMatch[1].trim();
+                if (currentChannel.category.length > 100) {
+                    currentChannel.category = currentChannel.category.substring(0, 100);
+                }
             }
             
         } else if (trimmedLine && !trimmedLine.startsWith('#') && currentChannel) {
-            if (trimmedLine.startsWith('http://') || trimmedLine.startsWith('https://')) {
+            if (trimmedLine.startsWith('http://') || trimmedLine.startsWith('https://') || trimmedLine.includes('://')) {
                 currentChannel.url = trimmedLine.trim();
                 
-                // Validate URL
+                // التحقق من صحة URL
                 if (currentChannel.url.length > 0 && currentChannel.name.length > 0) {
                     channels.push(currentChannel);
                 }
@@ -832,7 +1094,7 @@ function parseM3UContent(content) {
 // SUBSCRIPTION CODE API
 // ======================
 
-// Generate subscription codes
+// إنشاء رموز اشتراك
 app.post('/api/codes/generate', authenticateToken, [
     body('duration_days').isInt({ min: 1, max: 3650 }),
     body('quantity').isInt({ min: 1, max: 100 }),
@@ -859,7 +1121,28 @@ app.post('/api/codes/generate', authenticateToken, [
         
         try {
             for (let i = 0; i < quantity; i++) {
-                const code = generateSubscriptionCode();
+                let code;
+                let isUnique = false;
+                let attempts = 0;
+                
+                // التأكد من أن الرمز فريد
+                while (!isUnique && attempts < 10) {
+                    code = generateSubscriptionCode();
+                    const [existing] = await connection.execute(
+                        'SELECT id FROM subscription_codes WHERE code = ?',
+                        [code]
+                    );
+                    
+                    if (existing.length === 0) {
+                        isUnique = true;
+                    }
+                    attempts++;
+                }
+                
+                if (!isUnique) {
+                    throw new Error('Failed to generate unique code after 10 attempts');
+                }
+                
                 const expiryDate = new Date();
                 expiryDate.setDate(expiryDate.getDate() + duration_days);
                 
@@ -871,21 +1154,17 @@ app.post('/api/codes/generate', authenticateToken, [
                 );
                 
                 generatedCodes.push({
-                    id: null,
                     code,
                     duration_days,
                     code_type,
                     expiry_date: expiryDate.toISOString(),
-                    is_used: false,
-                    used_by: null,
-                    used_at: null,
                     generated_by: generatedBy,
-                    notes: notes || null,
-                    created_at: new Date().toISOString()
+                    notes: notes || null
                 });
             }
             
             await connection.commit();
+            await connection.release();
             
             await logActivity(req, 'code_generate', `Generated ${quantity} ${code_type} codes (${duration_days} days)`);
             
@@ -897,6 +1176,7 @@ app.post('/api/codes/generate', authenticateToken, [
             
         } catch (error) {
             await connection.rollback();
+            await connection.release();
             throw error;
         }
         
@@ -906,12 +1186,10 @@ app.post('/api/codes/generate', authenticateToken, [
             success: false, 
             message: 'Failed to generate codes' 
         });
-    } finally {
-        connection.release();
     }
 });
 
-// Get all codes
+// الحصول على جميع الرموز
 app.get('/api/codes', authenticateToken, async (req, res) => {
     try {
         const { status, search, page = 1, limit = 50 } = req.query;
@@ -947,7 +1225,7 @@ app.get('/api/codes', authenticateToken, async (req, res) => {
         
         const [codes] = await pool.execute(query, params);
         
-        // Get statistics
+        // الحصول على الإحصائيات
         const [stats] = await pool.execute(`
             SELECT 
                 COUNT(*) as total_codes,
@@ -978,12 +1256,12 @@ app.get('/api/codes', authenticateToken, async (req, res) => {
     }
 });
 
-// Delete code
+// حذف الرمز
 app.delete('/api/codes/:id', authenticateToken, async (req, res) => {
     try {
         const { id } = req.params;
         
-        // Check if code exists
+        // التحقق من وجود الرمز
         const [codes] = await pool.execute(
             'SELECT code FROM subscription_codes WHERE id = ?',
             [id]
@@ -998,7 +1276,7 @@ app.delete('/api/codes/:id', authenticateToken, async (req, res) => {
         
         const code = codes[0].code;
         
-        // Delete code
+        // حذف الرمز
         await pool.execute(
             'DELETE FROM subscription_codes WHERE id = ?',
             [id]
@@ -1024,7 +1302,7 @@ app.delete('/api/codes/:id', authenticateToken, async (req, res) => {
 // SUBSCRIPTION API FOR FLUTTER APP
 // ======================
 
-// Validate subscription code
+// التحقق من رمز الاشتراك
 app.post('/api/codes/validate', async (req, res) => {
     const connection = await pool.getConnection();
     
@@ -1032,6 +1310,7 @@ app.post('/api/codes/validate', async (req, res) => {
         const { code, device_id } = req.body;
         
         if (!code || !device_id) {
+            await connection.release();
             return res.status(400).json({ 
                 success: false, 
                 message: 'Code and device ID are required' 
@@ -1040,7 +1319,7 @@ app.post('/api/codes/validate', async (req, res) => {
         
         const cleanCode = code.trim();
         
-        // Validate code format - must be 12 digits
+        // التحقق من تنسيق الرمز - يجب أن يكون 12 رقمًا
         if (!/^\d{12}$/.test(cleanCode)) {
             await connection.release();
             return res.json({
@@ -1053,7 +1332,7 @@ app.post('/api/codes/validate', async (req, res) => {
         await connection.beginTransaction();
         
         try {
-            // Find valid, unused, non-expired code
+            // البحث عن رمز صالح وغير مستخدم وغير منتهي الصلاحية
             const [codes] = await connection.execute(`
                 SELECT * 
                 FROM subscription_codes 
@@ -1075,7 +1354,7 @@ app.post('/api/codes/validate', async (req, res) => {
             
             const subscriptionCode = codes[0];
             
-            // Check if device already has active subscription
+            // التحقق مما إذا كان الجهاز لديه اشتراك نشط بالفعل
             const [existingSubs] = await connection.execute(`
                 SELECT * FROM user_subscriptions 
                 WHERE user_id = ? AND is_active = TRUE AND expires_at > NOW()
@@ -1091,17 +1370,17 @@ app.post('/api/codes/validate', async (req, res) => {
                 });
             }
             
-            // Mark code as used
+            // وضع علامة على الرمز كمستخدم
             await connection.execute(
                 'UPDATE subscription_codes SET is_used = TRUE, used_by = ?, used_at = NOW() WHERE code = ?',
                 [device_id, cleanCode]
             );
             
-            // Calculate expiry date
+            // حساب تاريخ انتهاء الصلاحية
             const expiryDate = new Date();
             expiryDate.setDate(expiryDate.getDate() + subscriptionCode.duration_days);
             
-            // Create user subscription
+            // إنشاء اشتراك المستخدم
             await connection.execute(
                 `INSERT INTO user_subscriptions 
                 (id, user_id, subscription_code, device_id, expires_at, is_active) 
@@ -1109,7 +1388,7 @@ app.post('/api/codes/validate', async (req, res) => {
                 [uuidv4(), device_id, cleanCode, device_id, expiryDate]
             );
             
-            // Update app users
+            // تحديث مستخدمي التطبيق
             await connection.execute(
                 `INSERT INTO app_users (device_id, subscription_code, last_active) 
                 VALUES (?, ?, NOW()) 
@@ -1149,7 +1428,7 @@ app.post('/api/codes/validate', async (req, res) => {
     }
 });
 
-// Check subscription status (for Flutter app)
+// التحقق من حالة الاشتراك (للتطبيق)
 app.post('/api/subscription/status', async (req, res) => {
     try {
         const { device_id } = req.body;
@@ -1161,7 +1440,7 @@ app.post('/api/subscription/status', async (req, res) => {
             });
         }
         
-        // Check if device has active subscription
+        // التحقق مما إذا كان الجهاز لديه اشتراك نشط
         const [subscriptions] = await pool.execute(`
             SELECT us.*, sc.duration_days, sc.code_type, sc.code
             FROM user_subscriptions us
@@ -1215,7 +1494,7 @@ app.post('/api/subscription/status', async (req, res) => {
     }
 });
 
-// Activate subscription (for Flutter app)
+// تفعيل الاشتراك (للتطبيق)
 app.post('/api/subscription/activate', async (req, res) => {
     const connection = await pool.getConnection();
     
@@ -1232,7 +1511,7 @@ app.post('/api/subscription/activate', async (req, res) => {
         
         const cleanCode = code.trim();
         
-        // Validate code format - must be 12 digits
+        // التحقق من تنسيق الرمز - يجب أن يكون 12 رقمًا
         if (!/^\d{12}$/.test(cleanCode)) {
             await connection.release();
             return res.json({
@@ -1245,7 +1524,7 @@ app.post('/api/subscription/activate', async (req, res) => {
         await connection.beginTransaction();
         
         try {
-            // First validate the code
+            // أولاً التحقق من صحة الرمز
             const [codes] = await connection.execute(`
                 SELECT * 
                 FROM subscription_codes 
@@ -1267,7 +1546,7 @@ app.post('/api/subscription/activate', async (req, res) => {
             
             const subscriptionCode = codes[0];
             
-            // Check if device already has active subscription
+            // التحقق مما إذا كان الجهاز لديه اشتراك نشط بالفعل
             const [existingSubs] = await connection.execute(`
                 SELECT * FROM user_subscriptions 
                 WHERE user_id = ? AND is_active = TRUE AND expires_at > NOW()
@@ -1283,17 +1562,17 @@ app.post('/api/subscription/activate', async (req, res) => {
                 });
             }
             
-            // Mark code as used
+            // وضع علامة على الرمز كمستخدم
             await connection.execute(
                 'UPDATE subscription_codes SET is_used = TRUE, used_by = ?, used_at = NOW() WHERE code = ?',
                 [device_id, cleanCode]
             );
             
-            // Calculate expiry date
+            // حساب تاريخ انتهاء الصلاحية
             const expiryDate = new Date();
             expiryDate.setDate(expiryDate.getDate() + subscriptionCode.duration_days);
             
-            // Create user subscription
+            // إنشاء اشتراك المستخدم
             await connection.execute(
                 `INSERT INTO user_subscriptions 
                 (id, user_id, subscription_code, device_id, expires_at, is_active) 
@@ -1301,7 +1580,7 @@ app.post('/api/subscription/activate', async (req, res) => {
                 [uuidv4(), device_id, cleanCode, device_id, expiryDate]
             );
             
-            // Update app users
+            // تحديث مستخدمي التطبيق
             await connection.execute(
                 `INSERT INTO app_users (device_id, subscription_code, last_active) 
                 VALUES (?, ?, NOW()) 
@@ -1347,13 +1626,13 @@ app.post('/api/subscription/activate', async (req, res) => {
 // DASHBOARD API
 // ======================
 
-// Get dashboard statistics
+// الحصول على إحصائيات لوحة التحكم
 app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
     try {
-        // Get channel statistics
+        // الحصول على إحصائيات القنوات
         const [channelResult] = await pool.execute('SELECT COUNT(*) as total FROM channels');
         
-        // Get code statistics
+        // الحصول على إحصائيات الرموز
         const [codeStats] = await pool.execute(`
             SELECT 
                 COUNT(*) as total_codes,
@@ -1362,7 +1641,7 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
             FROM subscription_codes
         `);
         
-        // Get user statistics
+        // الحصول على إحصائيات المستخدمين
         const [userStats] = await pool.execute(`
             SELECT 
                 COUNT(DISTINCT user_id) as active_users,
@@ -1371,7 +1650,7 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
             WHERE expires_at > NOW() AND is_active = TRUE
         `);
         
-        // Get recent activities
+        // الحصول على النشاطات الأخيرة
         const [activities] = await pool.execute(`
             SELECT al.*, au.username as admin_name
             FROM activity_logs al
@@ -1380,13 +1659,22 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
             LIMIT 10
         `);
         
-        // Get channel categories
+        // الحصول على فئات القنوات
         const [categories] = await pool.execute(`
             SELECT category, COUNT(*) as count 
             FROM channels 
             WHERE category IS NOT NULL AND category != ''
             GROUP BY category 
             ORDER BY count DESC
+            LIMIT 10
+        `);
+        
+        // الحصول على مستخدمي التطبيق النشطين
+        const [recentUsers] = await pool.execute(`
+            SELECT device_id, last_active 
+            FROM app_users 
+            WHERE last_active > DATE_SUB(NOW(), INTERVAL 7 DAY)
+            ORDER BY last_active DESC
             LIMIT 10
         `);
         
@@ -1398,7 +1686,11 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
                     categories: categories
                 },
                 codes: codeStats[0],
-                users: userStats[0],
+                users: {
+                    active: userStats[0].active_users || 0,
+                    total_subscriptions: userStats[0].total_subscriptions || 0,
+                    recent_users: recentUsers
+                },
                 recent_activities: activities
             }
         });
@@ -1416,7 +1708,7 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
 // APP API (For Flutter App)
 // ======================
 
-// Get channels for app (public endpoint)
+// الحصول على القنوات للتطبيق (نقطة نهاية عامة)
 app.get('/api/app/channels', async (req, res) => {
     try {
         const { category } = req.query;
@@ -1433,7 +1725,7 @@ app.get('/api/app/channels', async (req, res) => {
         
         const [channels] = await pool.execute(query, params);
         
-        // Format channels for app
+        // تنسيق القنوات للتطبيق
         const formattedChannels = channels.map(channel => ({
             id: channel.id,
             name: channel.name || 'Unknown Channel',
@@ -1443,7 +1735,7 @@ app.get('/api/app/channels', async (req, res) => {
             is_active: true
         }));
         
-        // Get categories for filter
+        // الحصول على الفئات للتصفية
         const [categoriesResult] = await pool.execute(
             'SELECT DISTINCT category FROM channels WHERE is_active = TRUE AND category IS NOT NULL AND category != "" ORDER BY category'
         );
@@ -1469,7 +1761,7 @@ app.get('/api/app/channels', async (req, res) => {
     }
 });
 
-// Get app settings
+// الحصول على إعدادات التطبيق
 app.get('/api/app/settings', async (req, res) => {
     try {
         const [settings] = await pool.execute(
@@ -1481,9 +1773,11 @@ app.get('/api/app/settings', async (req, res) => {
             settingsObj[setting.setting_key] = setting.setting_value;
         });
         
-        // Add default values if missing
+        // إضافة قيم افتراضية إذا كانت مفقودة
         settingsObj.app_name = settingsObj.app_name || 'Watch Me Premium';
         settingsObj.company_name = settingsObj.company_name || 'Watch Me Streaming';
+        settingsObj.support_email = settingsObj.support_email || 'support@watchme.com';
+        settingsObj.version = settingsObj.version || '1.0.0';
         
         res.json({
             success: true,
@@ -1501,12 +1795,12 @@ app.get('/api/app/settings', async (req, res) => {
     }
 });
 
-// Generate subscription code helper
+// دالة مساعدة لإنشاء رمز اشتراك
 function generateSubscriptionCode() {
-    // Generate 12-digit numeric code
+    // إنشاء رمز رقمي مكون من 12 رقمًا
     let code = '';
     for (let i = 0; i < 12; i++) {
-        code += Math.floor(Math.random() * 10); // Generate random digit 0-9
+        code += Math.floor(Math.random() * 10); // توليد رقم عشوائي من 0-9
     }
     return code;
 }
@@ -1515,20 +1809,21 @@ function generateSubscriptionCode() {
 // ERROR HANDLING
 // ======================
 
-// 404 handler
+// معالج 404
 app.use((req, res) => {
     res.status(404).json({ 
         success: false, 
         message: 'API endpoint not found',
-        path: req.path
+        path: req.path,
+        method: req.method
     });
 });
 
-// Global error handler
+// معالج الأخطاء العام
 app.use((err, req, res, next) => {
     console.error('❌ Global error:', err);
     
-    // Handle specific errors
+    // التعامل مع أخطاء محددة
     if (err.code === 'LIMIT_FILE_SIZE') {
         return res.status(400).json({ 
             success: false, 
@@ -1543,7 +1838,7 @@ app.use((err, req, res, next) => {
         });
     }
     
-    // JWT errors
+    // أخطاء JWT
     if (err.name === 'JsonWebTokenError') {
         return res.status(401).json({ 
             success: false, 
@@ -1558,11 +1853,12 @@ app.use((err, req, res, next) => {
         });
     }
     
-    // Default error response
+    // استجابة الخطأ الافتراضية
     res.status(500).json({ 
         success: false, 
         message: 'Internal server error',
-        error: process.env.NODE_ENV === 'development' ? err.message : undefined
+        error: process.env.NODE_ENV === 'development' ? err.message : undefined,
+        timestamp: new Date().toISOString()
     });
 });
 
@@ -1576,7 +1872,7 @@ async function startServer() {
     try {
         await connectDB();
         
-        app.listen(PORT, '0.0.0.0', () => {
+        const server = app.listen(PORT, '0.0.0.0', () => {
             console.log(`🚀 Server running on port ${PORT}`);
             console.log(`📊 Health check: http://localhost:${PORT}/api/health`);
             console.log(`👑 Admin panel: http://localhost:${PORT}/index.html`);
@@ -1584,7 +1880,39 @@ async function startServer() {
             console.log(`🎯 Subscription API: http://localhost:${PORT}/api/subscription/status`);
             console.log(`🔐 Admin login: http://localhost:${PORT}/index.html (PIN: 123456789)`);
             console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
-            console.log(`🌐 CORS: Enabled for all origins (origin: *)`);
+            console.log(`🌐 CORS: Configured for multiple origins`);
+            console.log(`🗄️ Database: ${process.env.DB_NAME || 'railway'}`);
+            
+            // معلومات مفيدة للنشر
+            if (process.env.NODE_ENV === 'production') {
+                console.log(`⚡ Production mode enabled`);
+                console.log(`🔒 Trust proxy: Enabled`);
+                console.log(`🍪 Secure cookies: Enabled`);
+            }
+        });
+        
+        // معالجة إغلاق الخادم بشكل أنيق
+        process.on('SIGTERM', () => {
+            console.log('SIGTERM signal received: closing HTTP server');
+            server.close(() => {
+                console.log('HTTP server closed');
+                if (pool) {
+                    pool.end();
+                    console.log('Database connection pool closed');
+                }
+            });
+        });
+        
+        process.on('SIGINT', () => {
+            console.log('SIGINT signal received: closing HTTP server');
+            server.close(() => {
+                console.log('HTTP server closed');
+                if (pool) {
+                    pool.end();
+                    console.log('Database connection pool closed');
+                }
+                process.exit(0);
+            });
         });
         
     } catch (error) {
