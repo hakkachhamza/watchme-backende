@@ -48,7 +48,7 @@ const corsOptions = {
             'http://localhost:3000',
             'http://localhost:8080',
             'http://localhost:8081',
-            'https://watchme-admin.netlify.app',
+            'https://watchme0.netlify.app',
             // أضف أصول Netlify الخاصة بك هنا
             process.env.CORS_ORIGIN
         ].filter(Boolean);
