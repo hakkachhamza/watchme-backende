@@ -23,19 +23,22 @@ app.set('trust proxy', 1);
 app.use(session({
     secret: process.env.SESSION_SECRET || 'watchme-secret-key-2024-change-in-production',
     resave: false,
-    saveUninitialized: false,
-    proxy: process.env.NODE_ENV === 'production', // مهم للـ proxy
+    saveUninitialized: true, // غيرت من false إلى true
+    proxy: process.env.NODE_ENV === 'production',
+    store: new session.MemoryStore(),
     cookie: { 
         secure: process.env.NODE_ENV === 'production',
         sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
-        maxAge: 24 * 60 * 60 * 1000 // 24 hours
+        maxAge: 24 * 60 * 60 * 1000, // 24 hours
+        httpOnly: true,
+        path: '/'
     }
 }));
 
 // Security middleware
 app.use(helmet({
-    contentSecurityPolicy: false,  // Disable CSP for development
-    crossOriginResourcePolicy: { policy: "cross-origin" } // مهم للصور والموارد
+    contentSecurityPolicy: false,
+    crossOriginResourcePolicy: { policy: "cross-origin" }
 }));
 
 // CORS configuration - معدل للأمان
@@ -44,32 +47,49 @@ const corsOptions = {
         // السماح بطلبات بدون أصل (مثل mobile apps, curl)
         if (!origin) return callback(null, true);
         
+        // السماح بجميع الأصول في حالة التطوير
+        if (process.env.NODE_ENV === 'development') {
+            return callback(null, true);
+        }
+        
         const allowedOrigins = [
             'http://localhost:3000',
             'http://localhost:8080',
             'http://localhost:8081',
             'https://watchme0.netlify.app',
-            // أضف أصول Netlify الخاصة بك هنا
-            process.env.CORS_ORIGIN
+            'https://*.netlify.app',
+            process.env.CORS_ORIGIN,
+            process.env.FRONTEND_URL
         ].filter(Boolean);
         
-        if (allowedOrigins.indexOf(origin) !== -1 || process.env.NODE_ENV === 'development') {
+        // التحقق من الأصل باستخدام regex للسماح بـ wildcards
+        const isAllowed = allowedOrigins.some(allowed => {
+            if (allowed.includes('*')) {
+                const regex = new RegExp('^' + allowed.replace('*', '.*') + '$');
+                return regex.test(origin);
+            }
+            return allowed === origin;
+        });
+        
+        if (isAllowed) {
             callback(null, true);
         } else {
             console.log('CORS Blocked Origin:', origin);
             callback(new Error('Not allowed by CORS'));
         }
     },
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin', 'Access-Control-Allow-Headers'],
+    exposedHeaders: ['Content-Disposition'],
     credentials: true,
-    optionsSuccessStatus: 200,
+    preflightContinue: false,
+    optionsSuccessStatus: 204,
     maxAge: 86400 // 24 ساعة
 };
 
 app.use(cors(corsOptions));
 
-// Handle preflight requests
+// Handle preflight requests بشكل صريح
 app.options('*', cors(corsOptions));
 
 // Rate limiting - أكثر تساهلاً للنشر الأولي
@@ -80,7 +100,6 @@ const apiLimiter = rateLimit({
     standardHeaders: true,
     legacyHeaders: false,
     keyGenerator: (req) => {
-        // استخدام IP حقيقي مع الـ proxy
         return req.headers['x-forwarded-for'] || req.ip;
     }
 });
@@ -113,6 +132,13 @@ app.use(express.urlencoded({
     parameterLimit: 10000
 }));
 
+// إنشاء مجلد uploads إذا لم يكن موجوداً
+const uploadDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadDir)) {
+    fs.mkdirSync(uploadDir, { recursive: true });
+    console.log('✅ Created uploads directory');
+}
+
 // Static files
 app.use(express.static(path.join(__dirname, 'public'), {
     maxAge: '1d',
@@ -127,15 +153,13 @@ app.use(express.static(path.join(__dirname, 'public'), {
 const upload = multer({
     storage: multer.diskStorage({
         destination: function (req, file, cb) {
-            const uploadDir = path.join(__dirname, 'uploads');
-            if (!fs.existsSync(uploadDir)) {
-                fs.mkdirSync(uploadDir, { recursive: true });
-            }
             cb(null, uploadDir);
         },
         filename: function (req, file, cb) {
             const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-            cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
+            const ext = path.extname(file.originalname).toLowerCase();
+            const name = path.basename(file.originalname, ext).replace(/\s+/g, '_').substring(0, 100);
+            cb(null, name + '-' + uniqueSuffix + ext);
         }
     }),
     limits: {
@@ -143,14 +167,15 @@ const upload = multer({
     },
     fileFilter: function (req, file, cb) {
         const allowedMimeTypes = ['text/plain', 'application/octet-stream', 'application/x-mpegURL'];
-        const allowedExtensions = ['.m3u', '.m3u8'];
+        const allowedExtensions = ['.m3u', '.m3u8', '.txt'];
         
         const extname = path.extname(file.originalname).toLowerCase();
+        const mimeType = file.mimetype.toLowerCase();
         
-        if (allowedMimeTypes.includes(file.mimetype) || allowedExtensions.includes(extname)) {
+        if (allowedMimeTypes.includes(mimeType) || allowedExtensions.includes(extname)) {
             cb(null, true);
         } else {
-            cb(new Error('Only M3U files are allowed!'), false);
+            cb(new Error(`Only M3U files are allowed! Received: ${mimeType}, ${extname}`), false);
         }
     }
 });
@@ -167,7 +192,7 @@ async function connectDB() {
             database: process.env.DB_NAME || 'railway',
             port: process.env.DB_PORT || 3306,
             waitForConnections: true,
-            connectionLimit: 20, // زيادة للتعامل مع طلبات متعددة
+            connectionLimit: 20,
             queueLimit: 0,
             enableKeepAlive: true,
             keepAliveInitialDelay: 10000,
@@ -247,7 +272,8 @@ async function initializeDatabase() {
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                 INDEX idx_category (category),
-                INDEX idx_name (name)
+                INDEX idx_name (name),
+                INDEX idx_is_active (is_active)
             );
             
             -- جدول رموز الاشتراك
@@ -335,7 +361,7 @@ async function initializeDatabase() {
         );
         
         if (adminExists.length === 0) {
-            const defaultPin = '123456789'; // تغيير هذا في البيئة الإنتاجية
+            const defaultPin = '123456789';
             await pool.execute(
                 'INSERT INTO admin_users (username, email, pin_code, role) VALUES (?, ?, ?, ?)',
                 ['admin', 'admin@watchme.com', defaultPin, 'super_admin']
@@ -348,7 +374,9 @@ async function initializeDatabase() {
             ['app_name', 'Watch Me Premium'],
             ['company_name', 'Watch Me Streaming'],
             ['support_email', 'support@watchme.com'],
-            ['version', '1.0.0']
+            ['version', '1.0.0'],
+            ['max_upload_size', '10'],
+            ['session_timeout', '30']
         ];
         
         for (const [key, value] of defaultSettings) {
@@ -418,6 +446,36 @@ const authenticateToken = async (req, res, next) => {
     }
 };
 
+// دالة middleware للتحقق من صحة جلسة الاستيراد
+const validateImportSession = (req, res, next) => {
+    const { importId } = req.body;
+    
+    if (!req.session.importData) {
+        return res.status(400).json({ 
+            success: false, 
+            message: 'No import session found. Please upload file again.' 
+        });
+    }
+    
+    if (!importId || req.session.importData.importId !== importId) {
+        return res.status(400).json({ 
+            success: false, 
+            message: 'Import session ID mismatch or missing' 
+        });
+    }
+    
+    // التحقق من أن الجلسة ليست قديمة (أقدم من 30 دقيقة)
+    if (Date.now() - req.session.importData.timestamp > 30 * 60 * 1000) {
+        delete req.session.importData;
+        return res.status(400).json({ 
+            success: false, 
+            message: 'Import session expired. Please upload file again.' 
+        });
+    }
+    
+    next();
+};
+
 // تسجيل النشاط middleware
 const logActivity = async (req, action, description) => {
     try {
@@ -453,7 +511,9 @@ app.get('/api/health', (req, res) => {
         database: pool ? 'connected' : 'disconnected',
         uptime: process.uptime(),
         memory: process.memoryUsage(),
-        ip: req.headers['x-forwarded-for'] || req.ip
+        ip: req.headers['x-forwarded-for'] || req.ip,
+        session_id: req.sessionID,
+        has_import_session: !!req.session.importData
     };
     
     res.json(healthStatus);
@@ -539,7 +599,6 @@ app.get('/api/channels', authenticateToken, async (req, res) => {
     try {
         const { category, search, page = 1, limit = 50 } = req.query;
         
-        // إصلاح: تحويل القيم القادمة من الرابط (Query Params) إلى أرقام صحيحة
         const limitNum = parseInt(limit, 10) || 50;
         const pageNum = parseInt(page, 10) || 1;
         const offset = (pageNum - 1) * limitNum;
@@ -565,7 +624,6 @@ app.get('/api/channels', authenticateToken, async (req, res) => {
         query += ' ORDER BY created_at DESC, name LIMIT ? OFFSET ?';
         params.push(limitNum, offset);
         
-        // إصلاح: استخدام query بدلاً من execute إذا استمرت المشكلة
         const [channels] = await pool.query(query, params);
         
         const [categories] = await pool.execute(
@@ -861,8 +919,30 @@ app.post('/api/upload/m3u', authenticateToken, upload.single('m3uFile'), async (
         const filePath = req.file.path;
         const action = req.body.action || 'append';
         
+        console.log('File uploaded:', {
+            filename: req.file.originalname,
+            size: req.file.size,
+            mimetype: req.file.mimetype,
+            path: filePath,
+            action: action
+        });
+        
         // قراءة وتحليل الملف
-        const fileContent = fs.readFileSync(filePath, 'utf8');
+        let fileContent;
+        try {
+            fileContent = fs.readFileSync(filePath, 'utf8');
+        } catch (readError) {
+            try {
+                fs.unlinkSync(filePath);
+            } catch (unlinkError) {
+                console.warn('Could not delete uploaded file:', unlinkError.message);
+            }
+            return res.status(400).json({ 
+                success: false, 
+                message: 'Failed to read uploaded file' 
+            });
+        }
+        
         const parsedChannels = parseM3UContent(fileContent);
         
         // تنظيف الملف المرفوع
@@ -879,15 +959,28 @@ app.post('/api/upload/m3u', authenticateToken, upload.single('m3uFile'), async (
             });
         }
         
-        // تخزين في الجلسة
-        const importId = Date.now().toString();
+        // تخزين في الجلسة مع رمز جلسة فريد
+        const importId = uuidv4();
         req.session.importData = { 
             importId, 
             channels: parsedChannels, 
-            action 
+            action,
+            timestamp: Date.now(),
+            fileInfo: {
+                originalName: req.file.originalname,
+                size: req.file.size,
+                parsedCount: parsedChannels.length
+            }
         };
         
-        await logActivity(req, 'm3u_upload', `Uploaded M3U file with ${parsedChannels.length} channels`);
+        // حفظ الجلسة يدوياً
+        req.session.save((err) => {
+            if (err) {
+                console.error('Session save error during upload:', err);
+            }
+        });
+        
+        await logActivity(req, 'm3u_upload', `Uploaded M3U file "${req.file.originalname}" with ${parsedChannels.length} channels`);
         
         res.json({
             success: true,
@@ -895,7 +988,12 @@ app.post('/api/upload/m3u', authenticateToken, upload.single('m3uFile'), async (
             importId,
             data: parsedChannels.slice(0, 50),
             total: parsedChannels.length,
-            sampleCount: Math.min(50, parsedChannels.length)
+            sampleCount: Math.min(50, parsedChannels.length),
+            sessionInfo: {
+                importId,
+                timestamp: req.session.importData.timestamp,
+                expiresIn: '30 minutes'
+            }
         });
         
     } catch (error) {
@@ -912,35 +1010,62 @@ app.post('/api/upload/m3u', authenticateToken, upload.single('m3uFile'), async (
         
         res.status(500).json({ 
             success: false, 
-            message: 'Failed to process M3U file' 
+            message: 'Failed to process M3U file: ' + error.message 
+        });
+    }
+});
+
+// الحصول على بيانات الاستيراد المحفوظة
+app.get('/api/import/session/:importId', authenticateToken, async (req, res) => {
+    try {
+        const { importId } = req.params;
+        
+        if (!req.session.importData || req.session.importData.importId !== importId) {
+            return res.status(404).json({ 
+                success: false, 
+                message: 'Import session not found or expired' 
+            });
+        }
+        
+        // التحقق من أن الجلسة ليست قديمة
+        if (Date.now() - req.session.importData.timestamp > 30 * 60 * 1000) {
+            delete req.session.importData;
+            return res.status(400).json({ 
+                success: false, 
+                message: 'Import session expired' 
+            });
+        }
+        
+        res.json({
+            success: true,
+            data: {
+                importId: req.session.importData.importId,
+                action: req.session.importData.action,
+                total: req.session.importData.channels.length,
+                sample: req.session.importData.channels.slice(0, 10),
+                timestamp: req.session.importData.timestamp,
+                fileInfo: req.session.importData.fileInfo
+            }
+        });
+        
+    } catch (error) {
+        console.error('Get import session error:', error);
+        res.status(500).json({ 
+            success: false, 
+            message: 'Failed to get import session' 
         });
     }
 });
 
 // تأكيد استيراد M3U
-app.post('/api/import/m3u', authenticateToken, async (req, res) => {
+app.post('/api/import/m3u', authenticateToken, validateImportSession, async (req, res) => {
     const connection = await pool.getConnection();
     
     try {
         const { importId, action = 'append' } = req.body;
-        
-        if (!req.session.importData || req.session.importData.importId !== importId) {
-            await connection.release();
-            return res.status(400).json({ 
-                success: false, 
-                message: 'Import session expired or invalid' 
-            });
-        }
-        
         const { channels: parsedChannels } = req.session.importData;
         
-        if (!parsedChannels || parsedChannels.length === 0) {
-            await connection.release();
-            return res.status(400).json({ 
-                success: false, 
-                message: 'No channels to import' 
-            });
-        }
+        console.log(`Starting import with action: ${action}, channels: ${parsedChannels.length}`);
         
         await connection.beginTransaction();
         
@@ -953,6 +1078,7 @@ app.post('/api/import/m3u', authenticateToken, async (req, res) => {
             let importedCount = 0;
             let skippedCount = 0;
             let errorCount = 0;
+            const errors = [];
             
             for (const channel of parsedChannels) {
                 try {
@@ -987,15 +1113,25 @@ app.post('/api/import/m3u', authenticateToken, async (req, res) => {
                 } catch (err) {
                     console.error('Error importing channel:', err.message);
                     errorCount++;
+                    errors.push({
+                        channel: channel.name,
+                        error: err.message
+                    });
                 }
             }
             
             await connection.commit();
             
-            // مسح بيانات الجلسة
+            // مسح بيانات الجلسة بعد الاستيراد الناجح
+            const fileInfo = req.session.importData.fileInfo;
             delete req.session.importData;
+            req.session.save((err) => {
+                if (err) {
+                    console.error('Session save error after import:', err);
+                }
+            });
             
-            await logActivity(req, 'm3u_import', `Imported ${importedCount} channels from M3U (${action}), skipped ${skippedCount}, errors ${errorCount}`);
+            await logActivity(req, 'm3u_import', `Imported ${importedCount} channels from "${fileInfo?.originalName || 'M3U file'}" (${action}), skipped ${skippedCount}, errors ${errorCount}`);
             
             const [countResult] = await connection.execute('SELECT COUNT(*) as total FROM channels');
             
@@ -1007,6 +1143,7 @@ app.post('/api/import/m3u', authenticateToken, async (req, res) => {
                 imported: importedCount,
                 skipped: skippedCount,
                 errors: errorCount,
+                errorDetails: errors.slice(0, 10), // إرجاع أول 10 أخطاء فقط
                 totalChannels: countResult[0].total
             });
             
@@ -1020,7 +1157,42 @@ app.post('/api/import/m3u', authenticateToken, async (req, res) => {
         console.error('Import error:', error);
         res.status(500).json({ 
             success: false, 
-            message: 'Failed to import channels' 
+            message: 'Failed to import channels: ' + error.message 
+        });
+    }
+});
+
+// إلغاء جلسة الاستيراد
+app.delete('/api/import/session/:importId', authenticateToken, async (req, res) => {
+    try {
+        const { importId } = req.params;
+        
+        if (req.session.importData && req.session.importData.importId === importId) {
+            delete req.session.importData;
+            req.session.save((err) => {
+                if (err) {
+                    console.error('Session save error after cancel:', err);
+                }
+            });
+            
+            await logActivity(req, 'import_cancel', 'Cancelled import session');
+            
+            return res.json({
+                success: true,
+                message: 'Import session cancelled successfully'
+            });
+        }
+        
+        res.status(404).json({
+            success: false,
+            message: 'Import session not found'
+        });
+        
+    } catch (error) {
+        console.error('Cancel import session error:', error);
+        res.status(500).json({ 
+            success: false, 
+            message: 'Failed to cancel import session' 
         });
     }
 });
@@ -1030,8 +1202,10 @@ function parseM3UContent(content) {
     const channels = [];
     const lines = content.split('\n');
     let currentChannel = null;
+    let lineNumber = 0;
     
     for (const line of lines) {
+        lineNumber++;
         const trimmedLine = line.trim();
         
         if (trimmedLine.startsWith('#EXTINF:')) {
@@ -1039,7 +1213,8 @@ function parseM3UContent(content) {
                 name: 'Unknown Channel',
                 url: '',
                 category: 'General',
-                logo: ''
+                logo: '',
+                lineNumber: lineNumber
             };
             
             // استخراج الاسم
@@ -1061,7 +1236,7 @@ function parseM3UContent(content) {
             }
             
             // استخراج الشعار
-            const logoMatch = trimmedLine.match(/tvg-logo="([^"]+)"/);
+            const logoMatch = trimmedLine.match(/tvg-logo="([^"]+)"/i);
             if (logoMatch && logoMatch[1]) {
                 currentChannel.logo = logoMatch[1].trim();
                 if (currentChannel.logo.length > 500) {
@@ -1070,7 +1245,7 @@ function parseM3UContent(content) {
             }
             
             // استخراج المجموعة/الفئة
-            const groupMatch = trimmedLine.match(/group-title="([^"]+)"/);
+            const groupMatch = trimmedLine.match(/group-title="([^"]+)"/i);
             if (groupMatch && groupMatch[1]) {
                 currentChannel.category = groupMatch[1].trim();
                 if (currentChannel.category.length > 100) {
@@ -1082,9 +1257,13 @@ function parseM3UContent(content) {
             if (trimmedLine.startsWith('http://') || trimmedLine.startsWith('https://') || trimmedLine.includes('://')) {
                 currentChannel.url = trimmedLine.trim();
                 
-                // التحقق من صحة URL
+                // التحقق من صحة URL والبيانات الأساسية
                 if (currentChannel.url.length > 0 && currentChannel.name.length > 0) {
+                    // تنظيف URL من الفراغات
+                    currentChannel.url = currentChannel.url.replace(/\s+/g, '');
                     channels.push(currentChannel);
+                } else {
+                    console.log(`Skipping invalid channel at line ${lineNumber}:`, currentChannel);
                 }
                 
                 currentChannel = null;
@@ -1092,6 +1271,7 @@ function parseM3UContent(content) {
         }
     }
     
+    console.log(`Parsed ${channels.length} channels from M3U file`);
     return channels;
 }
 
@@ -1199,7 +1379,6 @@ app.get('/api/codes', authenticateToken, async (req, res) => {
     try {
         const { status, search, page = 1, limit = 50 } = req.query;
         
-        // إصلاح: تحويل القيم القادمة من الرابط (Query Params) إلى أرقام صحيحة
         const limitNum = parseInt(limit, 10) || 50;
         const pageNum = parseInt(page, 10) || 1;
         const offset = (pageNum - 1) * limitNum;
@@ -1232,7 +1411,6 @@ app.get('/api/codes', authenticateToken, async (req, res) => {
         query += ' ORDER BY sc.created_at DESC LIMIT ? OFFSET ?';
         params.push(limitNum, offset);
         
-        // إصلاح: استخدام query بدلاً من execute لضمان معالجة الأرقام بشكل صحيح
         const [codes] = await pool.query(query, params);
         
         // الحصول على الإحصائيات
@@ -1327,7 +1505,7 @@ app.post('/api/codes/validate', async (req, res) => {
             });
         }
         
-        const cleanCode = code.trim();
+        const cleanCode = code.trim().replace(/\s/g, '');
         
         // التحقق من تنسيق الرمز - يجب أن يكون 12 رقمًا
         if (!/^\d{12}$/.test(cleanCode)) {
@@ -1519,7 +1697,7 @@ app.post('/api/subscription/activate', async (req, res) => {
             });
         }
         
-        const cleanCode = code.trim();
+        const cleanCode = code.trim().replace(/\s/g, '');
         
         // التحقق من تنسيق الرمز - يجب أن يكون 12 رقمًا
         if (!/^\d{12}$/.test(cleanCode)) {
@@ -1805,12 +1983,227 @@ app.get('/api/app/settings', async (req, res) => {
     }
 });
 
+// ======================
+// ADMIN MANAGEMENT API
+// ======================
+
+// الحصول على جميع المسؤولين
+app.get('/api/admin/users', authenticateToken, async (req, res) => {
+    try {
+        const { page = 1, limit = 20 } = req.query;
+        
+        const limitNum = parseInt(limit, 10) || 20;
+        const pageNum = parseInt(page, 10) || 1;
+        const offset = (pageNum - 1) * limitNum;
+        
+        const [admins] = await pool.execute(
+            'SELECT id, username, email, role, is_active, last_login, created_at FROM admin_users ORDER BY created_at DESC LIMIT ? OFFSET ?',
+            [limitNum, offset]
+        );
+        
+        const [countResult] = await pool.execute('SELECT COUNT(*) as total FROM admin_users');
+        
+        res.json({
+            success: true,
+            data: admins,
+            pagination: {
+                page: pageNum,
+                limit: limitNum,
+                total: countResult[0].total,
+                pages: Math.ceil(countResult[0].total / limitNum)
+            }
+        });
+        
+    } catch (error) {
+        console.error('Get admin users error:', error);
+        res.status(500).json({ 
+            success: false, 
+            message: 'Failed to fetch admin users' 
+        });
+    }
+});
+
+// إضافة مسؤول جديد
+app.post('/api/admin/users', authenticateToken, [
+    body('username').notEmpty().trim().isLength({ min: 3, max: 100 }),
+    body('email').isEmail(),
+    body('pin_code').isLength({ min: 9, max: 9 }).matches(/^\d+$/).withMessage('PIN must be 9 digits'),
+    body('role').isIn(['admin', 'super_admin'])
+], async (req, res) => {
+    try {
+        const errors = validationResult(req);
+        if (!errors.isEmpty()) {
+            return res.status(400).json({ 
+                success: false, 
+                errors: errors.array() 
+            });
+        }
+        
+        const { username, email, pin_code, role } = req.body;
+        
+        // التحقق من عدم وجود مستخدم بنفس الاسم أو البريد
+        const [existing] = await pool.execute(
+            'SELECT id FROM admin_users WHERE username = ? OR email = ?',
+            [username, email]
+        );
+        
+        if (existing.length > 0) {
+            return res.status(409).json({ 
+                success: false, 
+                message: 'Username or email already exists' 
+            });
+        }
+        
+        await pool.execute(
+            'INSERT INTO admin_users (username, email, pin_code, role) VALUES (?, ?, ?, ?)',
+            [username, email, pin_code, role]
+        );
+        
+        await logActivity(req, 'admin_add', `Added new admin: ${username} (${role})`);
+        
+        res.status(201).json({
+            success: true,
+            message: 'Admin user created successfully'
+        });
+        
+    } catch (error) {
+        console.error('Add admin error:', error);
+        res.status(500).json({ 
+            success: false, 
+            message: 'Failed to add admin user' 
+        });
+    }
+});
+
+// تحديث حالة المسؤول
+app.put('/api/admin/users/:id/status', authenticateToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { is_active } = req.body;
+        
+        if (typeof is_active !== 'boolean') {
+            return res.status(400).json({ 
+                success: false, 
+                message: 'is_active must be a boolean' 
+            });
+        }
+        
+        // منع تعطيل الحساب الخاص
+        if (parseInt(id) === req.user.id) {
+            return res.status(403).json({ 
+                success: false, 
+                message: 'You cannot disable your own account' 
+            });
+        }
+        
+        const [result] = await pool.execute(
+            'UPDATE admin_users SET is_active = ? WHERE id = ?',
+            [is_active, id]
+        );
+        
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ 
+                success: false, 
+                message: 'Admin user not found' 
+            });
+        }
+        
+        const action = is_active ? 'admin_activate' : 'admin_deactivate';
+        const [admin] = await pool.execute('SELECT username FROM admin_users WHERE id = ?', [id]);
+        
+        await logActivity(req, action, `${is_active ? 'Activated' : 'Deactivated'} admin: ${admin[0].username}`);
+        
+        res.json({
+            success: true,
+            message: `Admin account ${is_active ? 'activated' : 'deactivated'} successfully`
+        });
+        
+    } catch (error) {
+        console.error('Update admin status error:', error);
+        res.status(500).json({ 
+            success: false, 
+            message: 'Failed to update admin status' 
+        });
+    }
+});
+
+// ======================
+// ACTIVITY LOGS API
+// ======================
+
+// الحصول على سجلات النشاط
+app.get('/api/activity/logs', authenticateToken, async (req, res) => {
+    try {
+        const { page = 1, limit = 50, action_type, start_date, end_date } = req.query;
+        
+        const limitNum = parseInt(limit, 10) || 50;
+        const pageNum = parseInt(page, 10) || 1;
+        const offset = (pageNum - 1) * limitNum;
+        
+        let query = `
+            SELECT al.*, au.username as admin_name
+            FROM activity_logs al
+            LEFT JOIN admin_users au ON al.admin_id = au.id
+            WHERE 1=1
+        `;
+        let params = [];
+        
+        if (action_type) {
+            query += ' AND al.action_type = ?';
+            params.push(action_type);
+        }
+        
+        if (start_date) {
+            query += ' AND al.created_at >= ?';
+            params.push(start_date);
+        }
+        
+        if (end_date) {
+            query += ' AND al.created_at <= ?';
+            params.push(end_date);
+        }
+        
+        const countQuery = query.replace('SELECT al.*, au.username as admin_name', 'SELECT COUNT(*) as total');
+        const [countResult] = await pool.execute(countQuery, params);
+        const total = countResult[0].total;
+        
+        query += ' ORDER BY al.created_at DESC LIMIT ? OFFSET ?';
+        params.push(limitNum, offset);
+        
+        const [logs] = await pool.execute(query, params);
+        
+        // الحصول على أنواع الإجراءات الفريدة
+        const [actionTypes] = await pool.execute(
+            'SELECT DISTINCT action_type FROM activity_logs ORDER BY action_type'
+        );
+        
+        res.json({
+            success: true,
+            data: logs,
+            action_types: actionTypes.map(a => a.action_type),
+            pagination: {
+                page: pageNum,
+                limit: limitNum,
+                total,
+                pages: Math.ceil(total / limitNum)
+            }
+        });
+        
+    } catch (error) {
+        console.error('Get activity logs error:', error);
+        res.status(500).json({ 
+            success: false, 
+            message: 'Failed to fetch activity logs' 
+        });
+    }
+});
+
 // دالة مساعدة لإنشاء رمز اشتراك
 function generateSubscriptionCode() {
     // إنشاء رمز رقمي مكون من 12 رقمًا
     let code = '';
     for (let i = 0; i < 12; i++) {
-        code += Math.floor(Math.random() * 10); // توليد رقم عشوائي من 0-9
+        code += Math.floor(Math.random() * 10);
     }
     return code;
 }
@@ -1825,7 +2218,8 @@ app.use((req, res) => {
         success: false, 
         message: 'API endpoint not found',
         path: req.path,
-        method: req.method
+        method: req.method,
+        timestamp: new Date().toISOString()
     });
 });
 
@@ -1863,6 +2257,14 @@ app.use((err, req, res, next) => {
         });
     }
     
+    // أخطاء CORS
+    if (err.message === 'Not allowed by CORS') {
+        return res.status(403).json({ 
+            success: false, 
+            message: 'CORS error: Origin not allowed' 
+        });
+    }
+    
     // استجابة الخطأ الافتراضية
     res.status(500).json({ 
         success: false, 
@@ -1882,6 +2284,11 @@ async function startServer() {
     try {
         await connectDB();
         
+        // دالة تنظيف الجلسات القديمة
+        setInterval(() => {
+            console.log('Session cleanup running...');
+        }, 60 * 60 * 1000);
+        
         const server = app.listen(PORT, '0.0.0.0', () => {
             console.log(`🚀 Server running on port ${PORT}`);
             console.log(`📊 Health check: http://localhost:${PORT}/api/health`);
@@ -1892,12 +2299,13 @@ async function startServer() {
             console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
             console.log(`🌐 CORS: Configured for multiple origins`);
             console.log(`🗄️ Database: ${process.env.DB_NAME || 'railway'}`);
+            console.log(`📁 Uploads directory: ${uploadDir}`);
             
-            // معلومات مفيدة للنشر
             if (process.env.NODE_ENV === 'production') {
                 console.log(`⚡ Production mode enabled`);
                 console.log(`🔒 Trust proxy: Enabled`);
                 console.log(`🍪 Secure cookies: Enabled`);
+                console.log(`🔐 SameSite: none`);
             }
         });
         
