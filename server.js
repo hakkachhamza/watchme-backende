@@ -19,19 +19,17 @@ const app = express();
 // حل مشكلة الـ Proxy في Railway
 app.set('trust proxy', 1);
 
-// Session middleware - معدل للعمل مع Railway
+// إعدادات الـ Session المحدثة
 app.use(session({
-    secret: process.env.SESSION_SECRET || 'watchme-secret-key-2024-change-in-production',
-    resave: false,
-    saveUninitialized: true, // غيرت من false إلى true
-    proxy: process.env.NODE_ENV === 'production',
-    store: new session.MemoryStore(),
-    cookie: { 
-        secure: process.env.NODE_ENV === 'production',
-        sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
-        maxAge: 24 * 60 * 60 * 1000, // 24 hours
-        httpOnly: true,
-        path: '/'
+    secret: process.env.SESSION_SECRET || 'your-strong-secret',
+    resave: true, // اجعلها true لضمان تحديث الجلسة
+    saveUninitialized: false,
+    proxy: true, // ضروري لأن Railway يعمل خلف Proxy
+    cookie: {
+        secure: true, // ضروري لأنك تستخدم HTTPS
+        sameSite: 'none', // السطر السحري لحل مشكلة Session Expired بين Netlify و Railway
+        maxAge: 60 * 60 * 1000, // ساعة واحدة
+        httpOnly: true
     }
 }));
 
@@ -41,56 +39,16 @@ app.use(helmet({
     crossOriginResourcePolicy: { policy: "cross-origin" }
 }));
 
-// CORS configuration - معدل للأمان
-const corsOptions = {
-    origin: function (origin, callback) {
-        // السماح بطلبات بدون أصل (مثل mobile apps, curl)
-        if (!origin) return callback(null, true);
-        
-        // السماح بجميع الأصول في حالة التطوير
-        if (process.env.NODE_ENV === 'development') {
-            return callback(null, true);
-        }
-        
-        const allowedOrigins = [
-            'http://localhost:3000',
-            'http://localhost:8080',
-            'http://localhost:8081',
-            'https://watchme0.netlify.app',
-            'https://*.netlify.app',
-            process.env.CORS_ORIGIN,
-            process.env.FRONTEND_URL
-        ].filter(Boolean);
-        
-        // التحقق من الأصل باستخدام regex للسماح بـ wildcards
-        const isAllowed = allowedOrigins.some(allowed => {
-            if (allowed.includes('*')) {
-                const regex = new RegExp('^' + allowed.replace('*', '.*') + '$');
-                return regex.test(origin);
-            }
-            return allowed === origin;
-        });
-        
-        if (isAllowed) {
-            callback(null, true);
-        } else {
-            console.log('CORS Blocked Origin:', origin);
-            callback(new Error('Not allowed by CORS'));
-        }
-    },
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin', 'Access-Control-Allow-Headers'],
-    exposedHeaders: ['Content-Disposition'],
-    credentials: true,
-    preflightContinue: false,
-    optionsSuccessStatus: 204,
-    maxAge: 86400 // 24 ساعة
-};
-
-app.use(cors(corsOptions));
+// تحديث إعدادات الـ CORS
+app.use(cors({
+    origin: 'https://watchme0.netlify.app', // رابط الفرونت إند الخاص بك
+    credentials: true, // ضروري جداً للسماح بتبادل الجلسات (Cookies)
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
+}));
 
 // Handle preflight requests بشكل صريح
-app.options('*', cors(corsOptions));
+app.options('*', cors());
 
 // Rate limiting - أكثر تساهلاً للنشر الأولي
 const apiLimiter = rateLimit({
@@ -132,7 +90,7 @@ app.use(express.urlencoded({
     parameterLimit: 10000
 }));
 
-// إنشاء مجلد uploads إذا لم يكن موجوداً
+// حل مشكلة مجلد الرفع (uploads)
 const uploadDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadDir)) {
     fs.mkdirSync(uploadDir, { recursive: true });
@@ -2297,7 +2255,7 @@ async function startServer() {
             console.log(`🎯 Subscription API: http://localhost:${PORT}/api/subscription/status`);
             console.log(`🔐 Admin login: http://localhost:${PORT}/index.html (PIN: 123456789)`);
             console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
-            console.log(`🌐 CORS: Configured for multiple origins`);
+            console.log(`🌐 CORS: Configured for https://watchme0.netlify.app with credentials`);
             console.log(`🗄️ Database: ${process.env.DB_NAME || 'railway'}`);
             console.log(`📁 Uploads directory: ${uploadDir}`);
             
